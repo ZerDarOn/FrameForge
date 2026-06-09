@@ -1,6 +1,7 @@
 mod commands;
 mod db;
 mod models;
+mod ai;
 
 use db::DbState;
 use tauri::Manager;
@@ -26,6 +27,7 @@ pub fn run() {
             std::fs::create_dir_all(&app_dir).ok();
             let conn = db::init_db(&app_dir).expect("数据库初始化失败");
             app.manage(DbState::new(conn));
+            app.manage(ai::AiConfig::new(ai::config::AiConfigState::default()));
 
             Ok(())
         })
@@ -48,6 +50,13 @@ pub fn run() {
             commands::asset::update_asset_transform,
             commands::asset::export_png_sequence,
             commands::asset::export_gif,
+            commands::ai_config::get_ai_config,
+            commands::ai_config::set_ai_api_key,
+            commands::ai_config::toggle_ai_provider,
+            commands::ai_config::set_default_ai_provider,
+            commands::analysis::analyze_track,
+            commands::analysis::get_analysis_reports,
+            commands::analysis::delete_analysis_report,
         ])
         .run(tauri::generate_context!())
         .expect("启动失败");

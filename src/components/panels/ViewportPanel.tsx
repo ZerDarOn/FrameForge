@@ -4,6 +4,7 @@ import { useUIStore } from "../../stores/uiStore";
 import { useFullImage } from "../../hooks/useThumbnail";
 import { BaselineOverlay } from "../viewport/BaselineOverlay";
 import { MagnifierOverlay } from "../viewport/MagnifierOverlay";
+import { AnalysisOverlay } from "../viewport/AnalysisOverlay";
 
 type CompareMode = "none" | "side" | "overlay" | "wipe";
 
@@ -138,6 +139,9 @@ export function ViewportPanel() {
 
           {/* 基准点覆盖层 */}
           <BaselineOverlay imageRect={imageRect} />
+
+          {/* 分析结果叠加层 */}
+          <AnalysisOverlay imageRect={imageRect} />
 
           {/* A/B 对比：叠加模式 */}
           {compareMode === "overlay" && compareImage && (

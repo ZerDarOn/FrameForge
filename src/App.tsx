@@ -6,6 +6,7 @@ import { useDragDrop } from "./hooks/useDragDrop";
 import { useImportHandler } from "./hooks/useImportHandler";
 import { useProjectLoader } from "./hooks/useProjectLoader";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
+import { useAnalysisProgress } from "./hooks/useAnalysisProgress";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { TitleBar } from "./components/layout/TitleBar";
 import { MenuBar } from "./components/layout/MenuBar";
@@ -30,6 +31,7 @@ export default function App() {
   useImportHandler();
   useProjectLoader();
   useGlobalEvents();
+  useAnalysisProgress();
 
   // 监听菜单栏事件
   useEffect(() => {

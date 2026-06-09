@@ -57,6 +57,20 @@ pub fn create_tables(conn: &Connection) -> Result<(), String> {
             frame_index INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (project_id) REFERENCES projects(id)
         );
+
+        CREATE TABLE IF NOT EXISTS analysis_reports (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            track_id TEXT NOT NULL,
+            analyzed_at INTEGER NOT NULL,
+            total_frames INTEGER NOT NULL,
+            displacement_json TEXT NOT NULL DEFAULT '[]',
+            flicker_json TEXT NOT NULL DEFAULT '[]',
+            consistency_score REAL NOT NULL DEFAULT 0.0,
+            suggestions_json TEXT NOT NULL DEFAULT '[]',
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (track_id) REFERENCES tracks(id)
+        );
         ",
     )
     .map_err(|e| format!("创建表失败: {}", e))?;

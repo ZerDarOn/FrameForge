@@ -1,6 +1,8 @@
 import { useUIStore } from "../../stores/uiStore";
 import { useTimelineStore } from "../../stores/timelineStore";
 import { useBaselineStore } from "../../stores/baselineStore";
+import { useAnalysisStore } from "../../stores/analysisStore";
+import { useProjectStore } from "../../stores/projectStore";
 import { invoke } from "@tauri-apps/api/core";
 
 export function PropertiesPanel() {
@@ -58,9 +60,7 @@ export function PropertiesPanel() {
         ) : tab === "baseline" ? (
           <BaselineInfo />
         ) : tab === "ai" ? (
-          <div className="text-center text-gray-600 py-4">
-            AI分析功能将在后续版本实现
-          </div>
+          <AiAnalysisTab />
         ) : null}
       </div>
     </div>
@@ -242,6 +242,121 @@ function SliderRow({ label, value, min, max, step = 1, onChange }: {
         className="flex-1 accent-orange-500 h-1"
       />
       <span className="text-gray-400 w-10 text-right text-[10px]">{value.toFixed(step < 1 ? 1 : 0)}</span>
+    </div>
+  );
+}
+
+function AiAnalysisTab() {
+  const reports = useAnalysisStore((s) => s.reports);
+  const activeReportId = useAnalysisStore((s) => s.activeReportId);
+  const setActiveReport = useAnalysisStore((s) => s.setActiveReport);
+  const isAnalyzing = useAnalysisStore((s) => s.isAnalyzing);
+  const progress = useAnalysisStore((s) => s.progress);
+  const tracks = useTimelineStore((s) => s.tracks);
+  const project = useProjectStore((s) => s.project);
+  const analyzeTrack = useAnalysisStore((s) => s.analyzeTrack);
+  const currentFrame = useTimelineStore((s) => s.currentFrame);
+
+  const activeReport = reports.find((r) => r.id === activeReportId);
+  const currentDisplacement = activeReport?.displacement.find((d) => d.frameIndex === currentFrame);
+  const currentFlicker = activeReport?.flickerFrames.find((f) => f.frameIndex === currentFrame);
+  const currentSuggestions = activeReport?.suggestions.filter((s) => s.frameIndex === currentFrame);
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <div className="text-gray-400 font-medium text-xs mb-2">帧序列分析</div>
+        {project && tracks.length > 0 ? (
+          <div className="space-y-1.5">
+            {tracks.map((track) => (
+              <button
+                key={track.id}
+                className="w-full text-left px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded text-xs text-gray-300 disabled:opacity-50"
+                onClick={() => analyzeTrack(project.id, track.id)}
+                disabled={isAnalyzing}
+              >
+                {isAnalyzing ? "分析中..." : `分析: ${track.name}`}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="text-[10px] text-gray-600">先导入帧序列</div>
+        )}
+      </div>
+
+      {isAnalyzing && progress && (
+        <div>
+          <div className="text-[10px] text-gray-500 mb-1">
+            {progress.stage === "loading" && "加载帧数据..."}
+            {progress.stage === "displacement" && "位移检测..."}
+            {progress.stage === "flicker" && "闪烁检测..."}
+            {progress.stage === "done" && "分析完成"}
+          </div>
+          <div className="w-full bg-gray-800 rounded-full h-1.5">
+            <div
+              className="bg-orange-500 h-1.5 rounded-full transition-all"
+              style={{ width: `${(progress.current / Math.max(progress.total, 1)) * 100}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {reports.length > 0 && (
+        <div>
+          <div className="text-gray-400 font-medium text-xs mb-2">分析报告</div>
+          <div className="space-y-1 max-h-32 overflow-y-auto">
+            {reports.map((r) => (
+              <div
+                key={r.id}
+                className={`px-2 py-1.5 rounded cursor-pointer text-[10px] ${
+                  activeReportId === r.id ? "bg-gray-700" : "hover:bg-gray-800"
+                }`}
+                onClick={() => setActiveReport(r.id)}
+              >
+                <div className="text-gray-300">{r.totalFrames}帧 | {new Date(r.analyzedAt).toLocaleTimeString()}</div>
+                <div className="text-gray-600">
+                  {r.displacement.filter((d) => d.severity === "high").length} 位移 | {" "}
+                  {r.flickerFrames.filter((f) => f.severity === "high").length} 闪烁
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {activeReport && (
+        <div>
+          <div className="text-gray-400 font-medium text-xs mb-2">帧 {currentFrame} 检测</div>
+          <div className="space-y-1.5">
+            {currentDisplacement && (
+              <div className={`px-2 py-1.5 rounded text-[10px] ${
+                currentDisplacement.severity === "high" ? "bg-red-900/30 text-red-400" :
+                currentDisplacement.severity === "medium" ? "bg-yellow-900/30 text-yellow-400" :
+                "bg-green-900/30 text-green-400"
+              }`}>
+                位移: dx={currentDisplacement.dx.toFixed(1)}, dy={currentDisplacement.dy.toFixed(1)} ({currentDisplacement.severity})
+              </div>
+            )}
+            {currentFlicker && (
+              <div className={`px-2 py-1.5 rounded text-[10px] ${
+                currentFlicker.severity === "high" ? "bg-red-900/30 text-red-400" :
+                currentFlicker.severity === "medium" ? "bg-yellow-900/30 text-yellow-400" :
+                "bg-green-900/30 text-green-400"
+              }`}>
+                闪烁: 分数={currentFlicker.score.toFixed(3)} ({currentFlicker.severity})
+              </div>
+            )}
+            {currentSuggestions && currentSuggestions.map((s, i) => (
+              <div key={i} className="px-2 py-1.5 bg-blue-900/30 rounded text-[10px] text-blue-300">
+                {s.suggestion}
+              </div>
+            ))}
+            {!currentDisplacement && !currentFlicker && (
+              <div className="text-[10px] text-gray-600">此帧无问题</div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

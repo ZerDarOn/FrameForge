@@ -3,11 +3,15 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { useTimelineStore } from "../../stores/timelineStore";
 import { undo, redo } from "../../stores/timelineStore";
 import { ExportDialog } from "../dialogs/ExportDialog";
+import { AiSettingsDialog } from "../ai/AiSettingsDialog";
+import { useProjectStore } from "../../stores/projectStore";
+import { useAnalysisStore } from "../../stores/analysisStore";
 
 export function MenuBar() {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showFullscreen, setShowFullscreen] = useState(false);
   const [showExport, setShowExport] = useState(false);
+  const [showAiSettings, setShowAiSettings] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -73,11 +77,15 @@ export function MenuBar() {
           { label: "全屏预览", shortcut: "F11", action: () => action(() => setShowFullscreen(true)) },
         ]} />
         <MenuDropdown label="AI工具" isOpen={openMenu === "ai"} onToggle={() => setOpenMenu(openMenu === "ai" ? null : "ai")} items={[
-          { label: "帧间位移检测", action: () => action(() => alert("AI分析功能将在后续版本实现")) },
-          { label: "闪烁检测", action: () => action(() => alert("AI分析功能将在后续版本实现")) },
-          { label: "角色一致性检查", action: () => action(() => alert("AI分析功能将在后续版本实现")) },
+          { label: "分析当前轨道", action: () => action(() => {
+            const project = useProjectStore.getState().project;
+            const track = useTimelineStore.getState().tracks[0];
+            if (project && track) {
+              useAnalysisStore.getState().analyzeTrack(project.id, track.id);
+            }
+          })},
           { type: "separator" },
-          { label: "自动基准点对齐", action: () => action(() => alert("AI分析功能将在后续版本实现")) },
+          { label: "AI 设置...", action: () => action(() => setShowAiSettings(true)) },
         ]} />
         <MenuDropdown label="导出" isOpen={openMenu === "export"} onToggle={() => setOpenMenu(openMenu === "export" ? null : "export")} items={[
           { label: "导出...", action: () => action(() => setShowExport(true)) },
@@ -96,6 +104,9 @@ export function MenuBar() {
 
       {/* 导出对话框 */}
       {showExport && <ExportDialog onClose={() => setShowExport(false)} />}
+
+      {/* AI 设置对话框 */}
+      {showAiSettings && <AiSettingsDialog onClose={() => setShowAiSettings(false)} />}
     </>
   );
 }

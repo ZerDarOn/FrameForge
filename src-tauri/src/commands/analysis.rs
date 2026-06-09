@@ -1,6 +1,7 @@
 use crate::ai::AiConfig;
 use crate::ai::analysis::displacement::detect_displacement_simple;
 use crate::ai::analysis::flicker::detect_flicker_simple;
+use crate::ai::analysis::cloud;
 use crate::ai::providers::AnalysisReport;
 use crate::db::DbState;
 use rusqlite::params;
@@ -165,4 +166,91 @@ pub fn delete_analysis_report(db: State<'_, DbState>, report_id: String) -> Resu
     conn.execute("DELETE FROM analysis_reports WHERE id = ?1", params![report_id])
         .map_err(|e| format!("删除报告失败: {}", e))?;
     Ok(())
+}
+
+/// 云端一致性检查（OpenAI GPT-4V）
+#[tauri::command]
+pub fn cloud_consistency_check(
+    config: State<'_, AiConfig>,
+    app: AppHandle,
+    project_id: String,
+    track_id: String,
+    db: State<'_, DbState>,
+) -> Result<AnalysisReport, String> {
+    let cfg = config.lock().map_err(|e| format!("配置锁失败: {}", e))?;
+    let openai_provider = cfg.providers.iter()
+        .find(|p| p.id == "openai")
+        .ok_or("未找到 OpenAI Provider")?.clone();
+    let api_key = cfg.api_keys.get("openai")
+        .ok_or("未配置 OpenAI API Key")?.clone();
+    drop(cfg);
+
+    let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
+    let mut stmt = conn
+        .prepare("SELECT source_path FROM assets WHERE track_id = ?1 ORDER BY start_frame")
+        .map_err(|e| format!("查询资产失败: {}", e))?;
+    let paths: Vec<String> = stmt.query_map(params![track_id], |row| row.get(0))
+        .map_err(|e| format!("读取路径失败: {}", e))?
+        .filter_map(|p| p.ok()).collect();
+    drop(stmt);
+    drop(conn);
+
+    if paths.is_empty() {
+        return Err("轨道中没有帧".to_string());
+    }
+
+    app.emit("analysis-progress", serde_json::json!({
+        "stage": "loading", "current": 0, "total": paths.len()
+    })).ok();
+
+    // 编码帧为 base64
+    let mut frames_b64 = Vec::new();
+    for (i, path) in paths.iter().enumerate() {
+        let data = std::fs::read(path).map_err(|e| format!("读取帧 {} 失败: {}", i, e))?;
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+        frames_b64.push(b64);
+    }
+
+    app.emit("analysis-progress", serde_json::json!({
+        "stage": "consistency", "current": 0, "total": 1
+    })).ok();
+
+    // 调用云端分析
+    let consistency = cloud::check_consistency_openai(&openai_provider, &api_key, &frames_b64)?;
+
+    // 生成建议
+    let issues: Vec<(i64, String, String)> = vec![
+        (0, "consistency".to_string(), consistency.description.clone()),
+    ];
+    let suggestions = cloud::generate_suggestions_openai(&openai_provider, &api_key, &issues)
+        .unwrap_or_default();
+
+    let report = AnalysisReport {
+        id: uuid::Uuid::new_v4().to_string(),
+        project_id,
+        track_id,
+        analyzed_at: chrono::Utc::now().timestamp_millis(),
+        total_frames: paths.len() as i64,
+        displacement: vec![],
+        flicker_frames: vec![],
+        consistency_score: consistency.score,
+        suggestions,
+    };
+
+    // 保存
+    let conn2 = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
+    conn2.execute(
+        "INSERT INTO analysis_reports (id, project_id, track_id, analyzed_at, total_frames, displacement_json, flicker_json, consistency_score, suggestions_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            report.id, report.project_id, report.track_id, report.analyzed_at,
+            report.total_frames, "[]", "[]", report.consistency_score,
+            serde_json::to_string(&report.suggestions).unwrap_or("[]".to_string()),
+        ],
+    ).map_err(|e| format!("保存报告失败: {}", e))?;
+
+    app.emit("analysis-progress", serde_json::json!({
+        "stage": "done", "current": 1, "total": 1
+    })).ok();
+
+    Ok(report)
 }

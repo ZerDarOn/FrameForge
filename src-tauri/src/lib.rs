@@ -57,6 +57,7 @@ pub fn run() {
             commands::analysis::analyze_track,
             commands::analysis::get_analysis_reports,
             commands::analysis::delete_analysis_report,
+            commands::analysis::cloud_consistency_check,
             commands::generation::generate_pixel_art,
             commands::generation::list_generated_assets,
             commands::generation::delete_generated_asset,

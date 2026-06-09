@@ -458,3 +458,76 @@ fn get_image_dimensions(path: &str) -> (i64, i64) {
     }
     (0, 0)
 }
+
+/// 导出当前项目为 GIF 动画
+#[tauri::command]
+pub fn export_gif(
+    db: State<'_, DbState>,
+    project_id: String,
+    output_path: String,
+    fps: i64,
+) -> Result<usize, String> {
+    let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
+
+    let mut track_stmt = conn
+        .prepare("SELECT id FROM tracks WHERE project_id = ?1 ORDER BY track_order")
+        .map_err(|e| format!("查询轨道失败: {}", e))?;
+
+    let track_ids: Vec<String> = track_stmt
+        .query_map(params![project_id], |row| row.get(0))
+        .map_err(|e| format!("读取轨道失败: {}", e))?
+        .filter_map(|t| t.ok())
+        .collect();
+    drop(track_stmt);
+
+    let mut frame_paths: Vec<String> = Vec::new();
+    for track_id in &track_ids {
+        let mut asset_stmt = conn
+            .prepare("SELECT source_path FROM assets WHERE track_id = ?1 ORDER BY start_frame")
+            .map_err(|e| format!("查询资产失败: {}", e))?;
+
+        let paths: Vec<String> = asset_stmt
+            .query_map(params![track_id], |row| row.get(0))
+            .map_err(|e| format!("读取资产失败: {}", e))?
+            .filter_map(|p| p.ok())
+            .collect();
+
+        frame_paths.extend(paths);
+    }
+
+    if frame_paths.is_empty() {
+        return Err("没有可导出的帧".to_string());
+    }
+
+    use std::fs::File;
+    use std::io::BufWriter;
+
+    let output_file = File::create(&output_path)
+        .map_err(|e| format!("创建输出文件失败: {}", e))?;
+    let writer = BufWriter::new(output_file);
+
+    let mut encoder = image::codecs::gif::GifEncoder::new(writer);
+    encoder.set_repeat(image::codecs::gif::Repeat::Infinite)
+        .map_err(|e| format!("设置 GIF 循环失败: {}", e))?;
+
+    let frame_delay_ms = (1000.0 / fps as f64).round() as u32;
+
+    for (i, path) in frame_paths.iter().enumerate() {
+        let src = Path::new(path);
+        if !src.exists() { continue; }
+
+        let img = image::io::Reader::open(path)
+            .map_err(|e| format!("打开帧 {} 失败: {}", i, e))?
+            .decode()
+            .map_err(|e| format!("解码帧 {} 失败: {}", i, e))?;
+
+        let rgba = img.to_rgba8();
+        let mut frame = image::Frame::from(rgba);
+        frame.delay = image::Delay::from_numer_denom_ms(frame_delay_ms, 1);
+
+        encoder.encode(&frame)
+            .map_err(|e| format!("编码帧 {} 失败: {}", i, e))?;
+    }
+
+    Ok(frame_paths.len())
+}

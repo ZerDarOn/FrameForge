@@ -1,13 +1,16 @@
 import { useState, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { useTimelineStore } from "../../stores/timelineStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { undo, redo } from "../../stores/timelineStore";
+import { ExportDialog } from "../dialogs/ExportDialog";
 
 export function MenuBar() {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showFullscreen, setShowFullscreen] = useState(false);
+  const [showExport, setShowExport] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -80,27 +83,11 @@ export function MenuBar() {
           { label: "自动基准点对齐", action: () => action(() => alert("AI分析功能将在后续版本实现")) },
         ]} />
         <MenuDropdown label="导出" isOpen={openMenu === "export"} onToggle={() => setOpenMenu(openMenu === "export" ? null : "export")} items={[
-          { label: "导出 PNG 序列帧", action: () => action(async () => {
-            const project = useProjectStore.getState().project;
-            if (!project) { alert("请先创建或打开项目"); return; }
-            const selected = await openDialog({ directory: true, title: "选择导出目录" });
-            if (!selected) return;
-            try {
-              const count = await invoke<number>("export_png_sequence", {
-                projectId: project.id,
-                outputDir: selected,
-              });
-              alert(`成功导出 ${count} 帧到:\n${selected}`);
-            } catch (err) {
-              alert(`导出失败: ${err}`);
-            }
-          })},
-          { label: "导出 GIF 动画", action: () => action(() => alert("导出功能将在后续版本实现")) },
-          { label: "导出 MP4 视频", action: () => action(() => alert("导出功能将在后续版本实现")) },
+          { label: "导出...", action: () => action(() => setShowExport(true)) },
         ]} />
         <MenuDropdown label="帮助" isOpen={openMenu === "help"} onToggle={() => setOpenMenu(openMenu === "help" ? null : "help")} items={[
           { label: "快捷键说明", action: () => action(() => alert(
-            "快捷键说明：\n\n空格 - 播放/暂停\n←/→ - 逐帧导航\n,/. - 逐帧后退/前进\nHome/End - 首帧/末帧\nDelete - 删除选中帧\nCtrl+D - 复制选中帧\nCtrl+=/- - 时间线缩放\nEsc - 停止播放\nF11 - 全屏预览"
+            "快捷键说明：\n\n空格 - 播放/暂停\n←/→ - 逐帧导航\n,/. - 逐帧后退/前进\nHome/End - 首帧/末帧\nDelete - 删除选中帧\nCtrl+D - 复制选中帧\nCtrl+=/- - 时间线缩放\nM - 放大镜工具\nB - 基准点标记工具\nEsc - 停止播放\nF11 - 全屏预览"
           )) },
           { type: "separator" },
           { label: "关于 FrameForge", action: () => action(() => alert("FrameForge v0.1.0\nAI动画帧审查工具")) },
@@ -109,6 +96,9 @@ export function MenuBar() {
 
       {/* 全屏预览 */}
       {showFullscreen && <FullscreenPreview onClose={() => setShowFullscreen(false)} />}
+
+      {/* 导出对话框 */}
+      {showExport && <ExportDialog onClose={() => setShowExport(false)} />}
     </>
   );
 }
@@ -135,9 +125,7 @@ function FullscreenPreview({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     if (currentAsset) {
-      invoke<string>("read_image_as_base64", { filePath: currentAsset.sourcePath })
-        .then(setImgSrc)
-        .catch(() => setImgSrc(null));
+      setImgSrc(convertFileSrc(currentAsset.sourcePath));
     } else {
       setImgSrc(null);
     }

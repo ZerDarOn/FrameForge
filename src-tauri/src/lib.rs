@@ -47,6 +47,7 @@ pub fn run() {
             commands::asset::delete_track,
             commands::asset::update_asset_transform,
             commands::asset::export_png_sequence,
+            commands::asset::export_gif,
         ])
         .run(tauri::generate_context!())
         .expect("启动失败");

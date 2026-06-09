@@ -2,7 +2,7 @@ import { useState, useCallback, useRef } from "react";
 import { useBaselineStore, getNextColor } from "../../stores/baselineStore";
 import { useTimelineStore } from "../../stores/timelineStore";
 import { useUIStore } from "../../stores/uiStore";
-import type { BaselineType, BaselinePoint } from "../../types/baseline";
+import type { BaselinePoint } from "../../types/baseline";
 
 interface Props {
   imageRect: { x: number; y: number; width: number; height: number } | null;

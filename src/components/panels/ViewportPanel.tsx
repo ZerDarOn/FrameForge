@@ -242,8 +242,6 @@ export function ViewportPanel() {
         containerRef={containerRef}
         imageSrc={currentImage}
         imageRect={imageRect}
-        viewZoom={viewZoom}
-        viewPan={viewPan}
       />
 
       {/* A/B 并排对比 */}

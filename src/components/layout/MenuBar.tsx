@@ -1,9 +1,6 @@
 import { useState, useRef, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useTimelineStore } from "../../stores/timelineStore";
-import { useProjectStore } from "../../stores/projectStore";
 import { undo, redo } from "../../stores/timelineStore";
 import { ExportDialog } from "../dialogs/ExportDialog";
 

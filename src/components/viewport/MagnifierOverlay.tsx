@@ -5,13 +5,11 @@ interface Props {
   containerRef: React.RefObject<HTMLDivElement | null>;
   imageSrc: string | null;
   imageRect: { x: number; y: number; width: number; height: number } | null;
-  viewZoom: number;
-  viewPan: { x: number; y: number };
 }
 
 const MAGNIFIER_SIZE = 160;
 
-export function MagnifierOverlay({ containerRef, imageSrc, imageRect, viewZoom, viewPan }: Props) {
+export function MagnifierOverlay({ containerRef, imageSrc, imageRect }: Props) {
   const viewportTool = useUIStore((s) => s.viewportTool);
   const magnifierZoom = useUIStore((s) => s.magnifierZoom);
   const setMagnifierZoom = useUIStore((s) => s.setMagnifierZoom);

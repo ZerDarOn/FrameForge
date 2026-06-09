@@ -7,6 +7,7 @@ export interface TextToPixelParams {
   palette?: string[];
   seed?: number;
   numVariants: number;
+  provider?: string;
 }
 
 export interface GeneratedAsset {

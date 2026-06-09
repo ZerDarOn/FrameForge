@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useGenerationStore } from "../../stores/generationStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { useTimelineStore } from "../../stores/timelineStore";
+import { useAiConfigStore } from "../../stores/aiConfigStore";
 import { listen } from "@tauri-apps/api/event";
 
 const STYLES = [
@@ -34,12 +35,22 @@ export function AiGenerationPanel() {
   const [prompt, setPrompt] = useState("");
   const [negativePrompt, setNegativePrompt] = useState("");
   const [style, setStyle] = useState("16bit");
-  const [sizeIndex, setSizeIndex] = useState(1); // 64x64
+  const [sizeIndex, setSizeIndex] = useState(1);
   const [variants, setVariants] = useState(1);
+  const [provider, setProvider] = useState<string>("openai");
+
+  const aiConfig = useAiConfigStore((s) => s.config);
+  const loadConfig = useAiConfigStore((s) => s.loadConfig);
+
+  // 获取可用的生成 Provider
+  const generationProviders = aiConfig?.providers.filter(
+    (p) => p.enabled && p.capabilities.includes("TextToPixel")
+  ) ?? [];
 
   useEffect(() => {
     if (project) loadAssets(project.id);
-  }, [project, loadAssets]);
+    loadConfig();
+  }, [project, loadAssets, loadConfig]);
 
   // 监听生成进度
   useEffect(() => {
@@ -61,6 +72,7 @@ export function AiGenerationPanel() {
       width: SIZES[sizeIndex].w,
       height: SIZES[sizeIndex].h,
       numVariants: variants,
+      provider,
     });
   };
 
@@ -159,6 +171,28 @@ export function AiGenerationPanel() {
             ))}
           </div>
         </div>
+
+        {/* 后端选择 */}
+        {generationProviders.length > 0 && (
+          <div>
+            <div className="text-gray-500 text-[10px] mb-1">后端</div>
+            <div className="flex gap-1">
+              {generationProviders.map((p) => (
+                <button
+                  key={p.id}
+                  className={`flex-1 py-1 rounded text-[10px] ${
+                    provider === p.id
+                      ? "bg-orange-600/30 text-orange-400 border border-orange-400"
+                      : "bg-gray-800 text-gray-500 hover:bg-gray-700"
+                  }`}
+                  onClick={() => setProvider(p.id)}
+                >
+                  {p.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* 错误提示 */}
         {error && (

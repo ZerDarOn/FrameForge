@@ -44,10 +44,25 @@ impl Default for AiConfigState {
                     capabilities: vec![
                         "ConsistencyCheck".to_string(),
                         "SuggestionGeneration".to_string(),
+                        "TextToPixel".to_string(),
                     ],
                     config: serde_json::json!({
                         "model": "gpt-4o",
                         "baseUrl": "https://api.openai.com/v1"
+                    }),
+                },
+                ProviderConfig {
+                    id: "stability".to_string(),
+                    name: "Stability AI".to_string(),
+                    provider_type: "StabilityAi".to_string(),
+                    enabled: false,
+                    capabilities: vec![
+                        "TextToPixel".to_string(),
+                        "ImageToPixel".to_string(),
+                    ],
+                    config: serde_json::json!({
+                        "engine": "stable-diffusion-xl-1.0",
+                        "baseUrl": "https://api.stability.ai/v1"
                     }),
                 },
             ],

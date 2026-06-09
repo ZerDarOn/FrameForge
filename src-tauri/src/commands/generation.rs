@@ -15,6 +15,7 @@ pub struct TextToPixelParams {
     pub palette: Option<Vec<String>>,
     pub seed: Option<u64>,
     pub num_variants: u32,
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -87,15 +88,19 @@ pub async fn generate_pixel_art(
     params: TextToPixelParams,
 ) -> Result<Vec<GeneratedAsset>, String> {
     let cfg = config.lock().map_err(|e| format!("配置锁失败: {}", e))?;
-    let api_key = cfg.api_keys.get("openai")
-        .ok_or("未配置 OpenAI API Key，请在 AI 设置中配置")?
-        .clone();
-    let base_url = cfg.providers.iter()
-        .find(|p| p.id == "openai")
-        .and_then(|p| p.config.get("baseUrl"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("https://api.openai.com/v1")
+    let provider_id = params.provider.as_deref()
+        .unwrap_or(&cfg.default_generation_provider)
         .to_string();
+
+    // 获取对应 provider 的 API key
+    let api_key = cfg.api_keys.get(&provider_id)
+        .ok_or(format!("未配置 {} API Key，请在 AI 设置中配置", provider_id))?
+        .clone();
+
+    let provider_config = cfg.providers.iter()
+        .find(|p| p.id == provider_id)
+        .ok_or(format!("未找到 Provider: {}", provider_id))?
+        .clone();
     drop(cfg);
 
     let enhanced_prompt = build_pixel_prompt(&params);
@@ -112,38 +117,12 @@ pub async fn generate_pixel_art(
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() + i as u64
         });
 
-        // 调用 DALL-E API
-        let client = reqwest::Client::new();
-        let response = client
-            .post(format!("{}/images/generations", base_url))
-            .header("Authorization", format!("Bearer {}", api_key))
-            .json(&serde_json::json!({
-                "model": "dall-e-3",
-                "prompt": enhanced_prompt,
-                "n": 1,
-                "size": format!("{}x{}", params.width.max(1024).to_string(), params.height.max(1024).to_string()),
-                "quality": "standard",
-                "response_format": "b64_json"
-            }))
-            .send()
-            .await
-            .map_err(|e| format!("API 请求失败: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("API 返回错误 {}: {}", status, body));
-        }
-
-        let json: serde_json::Value = response.json().await
-            .map_err(|e| format!("解析响应失败: {}", e))?;
-
-        let b64_data = json["data"][0]["b64_json"]
-            .as_str()
-            .ok_or("响应中缺少图片数据")?;
-
-        let img_bytes = base64::decode(b64_data)
-            .map_err(|e| format!("解码图片失败: {}", e))?;
+        // 根据后端类型调用不同 API
+        let img_bytes = if provider_id == "stability" {
+            generate_stability(&provider_config, &api_key, &enhanced_prompt, &params, seed)?
+        } else {
+            generate_openai(&provider_config, &api_key, &enhanced_prompt, &params).await?
+        };
 
         // 降采样到目标尺寸（DALL-E 最小 1024x1024）
         let img = image::load_from_memory(&img_bytes)
@@ -367,4 +346,108 @@ pub fn add_generated_to_timeline(
     ).map_err(|e| format!("导入资产失败: {}", e))?;
 
     Ok(tid)
+}
+
+use crate::ai::config::ProviderConfig;
+
+/// 调用 OpenAI DALL-E API
+async fn generate_openai(
+    provider_config: &ProviderConfig,
+    api_key: &str,
+    prompt: &str,
+    params: &TextToPixelParams,
+) -> Result<Vec<u8>, String> {
+    let base_url = provider_config.config.get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://api.openai.com/v1")
+        .to_string();
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/images/generations", base_url))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": "dall-e-3",
+            "prompt": prompt,
+            "n": 1,
+            "size": format!("{}x{}", params.width.max(1024), params.height.max(1024)),
+            "quality": "standard",
+            "response_format": "b64_json"
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI API 请求失败: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenAI API 返回错误 {}: {}", status, body));
+    }
+
+    let json: serde_json::Value = response.json().await
+        .map_err(|e| format!("解析响应失败: {}", e))?;
+
+    let b64_data = json["data"][0]["b64_json"]
+        .as_str()
+        .ok_or("响应中缺少图片数据")?;
+
+    base64::decode(b64_data)
+        .map_err(|e| format!("解码图片失败: {}", e))
+}
+
+/// 调用 Stability AI API
+fn generate_stability(
+    provider_config: &ProviderConfig,
+    api_key: &str,
+    prompt: &str,
+    params: &TextToPixelParams,
+    seed: u64,
+) -> Result<Vec<u8>, String> {
+    let base_url = provider_config.config.get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://api.stability.ai/v1")
+        .to_string();
+
+    let engine = provider_config.config.get("engine")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stable-diffusion-xl-1.0")
+        .to_string();
+
+    // Stability AI 使用同步 reqwest blocking client
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(format!("{}/generation/{}/text-to-image", base_url, engine))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .json(&serde_json::json!({
+            "text_prompts": [
+                { "text": prompt, "weight": 1.0 }
+            ],
+            "cfg_scale": 7,
+            "height": params.height.max(512),
+            "width": params.width.max(512),
+            "samples": 1,
+            "steps": 30,
+            "seed": seed,
+            "style_preset": "pixel-art"
+        }))
+        .send()
+        .map_err(|e| format!("Stability AI 请求失败: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        return Err(format!("Stability AI 返回错误 {}: {}", status, body));
+    }
+
+    let json: serde_json::Value = response.json()
+        .map_err(|e| format!("解析响应失败: {}", e))?;
+
+    let b64_data = json["artifacts"][0]["base64"]
+        .as_str()
+        .ok_or("响应中缺少图片数据")?;
+
+    base64::decode(b64_data)
+        .map_err(|e| format!("解码图片失败: {}", e))
 }

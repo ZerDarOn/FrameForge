@@ -35,6 +35,8 @@ pub fn run() {
             commands::project::get_project,
             commands::project::delete_project,
             commands::project::update_project,
+            commands::project::update_baseline_points,
+            commands::project::get_baseline_points,
             commands::asset::scan_image_folder,
             commands::asset::create_track,
             commands::asset::import_frames_to_track,

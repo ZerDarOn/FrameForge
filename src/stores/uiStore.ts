@@ -3,8 +3,10 @@ import type { ThumbnailQuality } from "../hooks/useThumbnail";
 
 type PanelTab = "assets" | "inspector";
 type PropertiesTab = "info" | "baseline" | "ai" | "transform";
+export type ViewportTool = "select" | "baseline" | "magnifier";
 
 interface UIState {
+  viewportTool: ViewportTool;
   sidebarTab: PanelTab;
   propertiesTab: PropertiesTab;
   sidebarWidth: number;
@@ -28,9 +30,11 @@ interface UIState {
   setMagnifierEnabled: (v: boolean) => void;
   setMagnifierZoom: (v: number) => void;
   setThumbnailQuality: (q: ThumbnailQuality) => void;
+  setViewportTool: (tool: ViewportTool) => void;
 }
 
 export const useUIStore = create<UIState>((set) => ({
+  viewportTool: "select",
   sidebarTab: "assets",
   propertiesTab: "info",
   sidebarWidth: 260,
@@ -54,4 +58,5 @@ export const useUIStore = create<UIState>((set) => ({
   setMagnifierEnabled: (v) => set({ magnifierEnabled: v }),
   setMagnifierZoom: (v) => set({ magnifierZoom: v }),
   setThumbnailQuality: (q) => set({ thumbnailQuality: q }),
+  setViewportTool: (tool) => set({ viewportTool: tool }),
 }));

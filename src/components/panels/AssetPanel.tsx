@@ -72,11 +72,24 @@ export function AssetPanel() {  const tab = useUIStore((s) => s.sidebarTab);
             </div>
             <div>
               <div className="text-gray-400 font-medium text-xs mb-2">放大镜</div>
-              <div className="text-[10px] text-gray-600">点击画面启用（功能开发中）</div>
+              <button
+                className={`w-full text-left px-2 py-1 rounded text-[10px] ${
+                  useUIStore.getState().viewportTool === "magnifier"
+                    ? "bg-orange-600/20 text-orange-400"
+                    : "text-gray-500 hover:bg-gray-800"
+                }`}
+                onClick={() => {
+                  const current = useUIStore.getState().viewportTool;
+                  useUIStore.getState().setViewportTool(current === "magnifier" ? "select" : "magnifier");
+                }}
+              >
+                🔍 启用放大镜
+              </button>
+              <div className="text-[9px] text-gray-600 pl-2 mt-1">在画面上移动鼠标查看像素细节（快捷键 M）</div>
             </div>
             <div>
               <div className="text-gray-400 font-medium text-xs mb-2">基准点</div>
-              <div className="text-[10px] text-gray-600">在画面上 Shift+点击 设定基准点</div>
+              <div className="text-[10px] text-gray-600">按 B 进入标记模式，在画面上点击设定基准点</div>
             </div>
           </div>
         )}

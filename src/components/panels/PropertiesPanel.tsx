@@ -1,5 +1,6 @@
 import { useUIStore } from "../../stores/uiStore";
 import { useTimelineStore } from "../../stores/timelineStore";
+import { useBaselineStore } from "../../stores/baselineStore";
 import { invoke } from "@tauri-apps/api/core";
 
 export function PropertiesPanel() {
@@ -135,12 +136,69 @@ function TransformInfo({ asset }: { asset: any }) {
 }
 
 function BaselineInfo() {
+  const points = useBaselineStore((s) => s.points);
+  const activePointId = useBaselineStore((s) => s.activePointId);
+  const setActivePoint = useBaselineStore((s) => s.setActivePoint);
+  const removePoint = useBaselineStore((s) => s.removePoint);
+  const markerType = useBaselineStore((s) => s.markerType);
+  const setMarkerType = useBaselineStore((s) => s.setMarkerType);
+  const viewportTool = useUIStore((s) => s.viewportTool);
+  const setViewportTool = useUIStore((s) => s.setViewportTool);
+  const isMarkerMode = viewportTool === "baseline";
+
   return (
-    <div className="text-center text-gray-600 py-4">
-      <div className="mb-2">在画面上点击设定基准点</div>
-      <div className="text-[10px] text-gray-700">
-        基准点用于对齐参考，可以是点、线或区域
+    <div className="space-y-3">
+      <div>
+        <div className="text-gray-400 font-medium text-xs mb-2">标记工具</div>
+        <div className="flex gap-1 mb-2">
+          <button
+            className={`flex-1 py-1.5 rounded text-xs ${isMarkerMode ? "bg-orange-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"}`}
+            onClick={() => setViewportTool(isMarkerMode ? "select" : "baseline")}
+          >
+            {isMarkerMode ? "退出标记" : "开始标记"}
+          </button>
+        </div>
+        {isMarkerMode && (
+          <div className="flex gap-1">
+            {(["point", "line", "region"] as const).map((t) => (
+              <button
+                key={t}
+                className={`flex-1 py-1 rounded text-[10px] ${markerType === t ? "bg-orange-600/30 text-orange-400 border border-orange-400" : "bg-gray-800 text-gray-500"}`}
+                onClick={() => setMarkerType(t)}
+              >
+                {t === "point" ? "点" : t === "line" ? "线" : "区域"}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
+
+      {points.length > 0 && (
+        <div>
+          <div className="text-gray-400 font-medium text-xs mb-2">基准点列表</div>
+          <div className="space-y-1">
+            {points.map((p) => (
+              <div
+                key={p.id}
+                className={`flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer ${activePointId === p.id ? "bg-gray-700" : "hover:bg-gray-800"}`}
+                onClick={() => setActivePoint(p.id)}
+              >
+                <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: p.color }} />
+                <span className="text-xs text-gray-300 flex-1 truncate">{p.name}</span>
+                <span className="text-[10px] text-gray-600">帧{p.frameIndex}</span>
+                <span className="text-[10px] text-gray-600">{p.type}</span>
+                <button className="text-[10px] text-red-500 hover:text-red-400" onClick={() => removePoint(p.id)}>✕</button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {points.length === 0 && (
+        <div className="text-[10px] text-gray-600 text-center py-4">
+          在视口中点击添加基准点
+        </div>
+      )}
     </div>
   );
 }

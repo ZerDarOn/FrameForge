@@ -2,6 +2,8 @@ import { useRef, useEffect, useState, useCallback } from "react";
 import { useTimelineStore } from "../../stores/timelineStore";
 import { useUIStore } from "../../stores/uiStore";
 import { useFullImage } from "../../hooks/useThumbnail";
+import { BaselineOverlay } from "../viewport/BaselineOverlay";
+import { MagnifierOverlay } from "../viewport/MagnifierOverlay";
 
 type CompareMode = "none" | "side" | "overlay" | "wipe";
 
@@ -19,6 +21,9 @@ export function ViewportPanel() {
   const [viewPan, setViewPan] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
   const lastMouseRef = useRef({ x: 0, y: 0 });
+  const viewportTool = useUIStore((s) => s.viewportTool);
+  const [imageRect, setImageRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
 
   // 获取当前帧资产
   const getAssetAtIndex = useCallback((frameIndex: number) => {
@@ -53,9 +58,31 @@ export function ViewportPanel() {
     return () => container.removeEventListener("wheel", handleWheel);
   }, []);
 
-  // 视口平移（中键拖拽或 Alt+左键）
+  // 追踪图片在容器中的位置和尺寸
+  useEffect(() => {
+    if (!imgRef.current || !containerRef.current) return;
+    const updateRect = () => {
+      const container = containerRef.current;
+      const img = imgRef.current;
+      if (!container || !img) return;
+      const containerRect = container.getBoundingClientRect();
+      const ir = img.getBoundingClientRect();
+      setImageRect({
+        x: ir.left - containerRect.left,
+        y: ir.top - containerRect.top,
+        width: ir.width,
+        height: ir.height,
+      });
+    };
+    updateRect();
+    const observer = new ResizeObserver(updateRect);
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, [currentImage, viewZoom, viewPan]);
+
+  // 视口平移（中键拖拽或 Alt+左键，工具模式下不触发）
   const handleMouseDown = (e: React.MouseEvent) => {
-    if (e.button === 1 || (e.button === 0 && e.altKey)) {
+    if ((e.button === 1 || (e.button === 0 && e.altKey)) && viewportTool === "select") {
       e.preventDefault();
       setIsPanning(true);
       lastMouseRef.current = { x: e.clientX, y: e.clientY };
@@ -107,7 +134,10 @@ export function ViewportPanel() {
           )}
 
           {/* 当前帧 */}
-          <img src={currentImage} alt={`帧 ${currentFrame}`} className="relative max-w-full max-h-full object-contain" />
+          <img ref={imgRef} src={currentImage} alt={`帧 ${currentFrame}`} className="relative max-w-full max-h-full object-contain" />
+
+          {/* 基准点覆盖层 */}
+          <BaselineOverlay imageRect={imageRect} />
 
           {/* A/B 对比：叠加模式 */}
           {compareMode === "overlay" && compareImage && (
@@ -206,6 +236,15 @@ export function ViewportPanel() {
           />
         )}
       </div>
+
+      {/* 放大镜覆盖层 */}
+      <MagnifierOverlay
+        containerRef={containerRef}
+        imageSrc={currentImage}
+        imageRect={imageRect}
+        viewZoom={viewZoom}
+        viewPan={viewPan}
+      />
 
       {/* A/B 并排对比 */}
       {compareMode === "side" && compareImage && (

@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useTimelineStore, undo, redo } from "../stores/timelineStore";
+import { useUIStore } from "../stores/uiStore";
 
 export function useKeyboardShortcuts() {
   useEffect(() => {
@@ -101,6 +102,16 @@ export function useKeyboardShortcuts() {
             e.preventDefault();
             window.dispatchEvent(new CustomEvent("frameforge:show-welcome"));
           }
+          break;
+        case "m":
+          e.preventDefault();
+          const curMagTool = useUIStore.getState().viewportTool;
+          useUIStore.getState().setViewportTool(curMagTool === "magnifier" ? "select" : "magnifier");
+          break;
+        case "b":
+          e.preventDefault();
+          const curBaseTool = useUIStore.getState().viewportTool;
+          useUIStore.getState().setViewportTool(curBaseTool === "baseline" ? "select" : "baseline");
           break;
       }
     };

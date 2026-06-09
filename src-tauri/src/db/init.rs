@@ -71,6 +71,26 @@ pub fn create_tables(conn: &Connection) -> Result<(), String> {
             FOREIGN KEY (project_id) REFERENCES projects(id),
             FOREIGN KEY (track_id) REFERENCES tracks(id)
         );
+
+        CREATE TABLE IF NOT EXISTS generated_assets (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            asset_type TEXT NOT NULL DEFAULT 'sprite',
+            prompt TEXT NOT NULL,
+            negative_prompt TEXT,
+            style TEXT NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            palette TEXT,
+            seed INTEGER,
+            provider TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            thumbnail_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            metadata TEXT,
+            FOREIGN KEY (project_id) REFERENCES projects(id)
+        );
         ",
     )
     .map_err(|e| format!("创建表失败: {}", e))?;

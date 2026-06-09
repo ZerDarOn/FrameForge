@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { ThumbnailQuality } from "../hooks/useThumbnail";
 
-type PanelTab = "assets" | "inspector";
+type PanelTab = "assets" | "inspector" | "ai";
 type PropertiesTab = "info" | "baseline" | "ai" | "transform";
 export type ViewportTool = "select" | "baseline" | "magnifier";
 

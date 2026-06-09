@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useUIStore } from "../../stores/uiStore";
 import { useTimelineStore } from "../../stores/timelineStore";
 import { useThumbnail } from "../../hooks/useThumbnail";
+import { AiGenerationPanel } from "../ai/AiGenerationPanel";
 
 export function AssetPanel() {  const tab = useUIStore((s) => s.sidebarTab);
   const setTab = useUIStore((s) => s.setSidebarTab);
@@ -20,10 +21,13 @@ export function AssetPanel() {  const tab = useUIStore((s) => s.sidebarTab);
       <div className="flex border-b border-gray-700">
         <TabButton active={tab === "assets"} onClick={() => setTab("assets")} label="资产库" />
         <TabButton active={tab === "inspector"} onClick={() => setTab("inspector")} label="检查器" />
+        <TabButton active={tab === "ai"} onClick={() => setTab("ai")} label="AI生成" />
       </div>
 
       <div className="flex-1 overflow-y-auto p-2">
-        {tab === "assets" ? (
+        {tab === "ai" ? (
+          <AiGenerationPanel />
+        ) : tab === "assets" ? (
           <div className="space-y-2">
             {tracks.map((track) => (
               <TrackCard key={track.id} track={track} updateTrack={updateTrack} removeTrack={removeTrack} />

@@ -1,6 +1,5 @@
 use crate::ai::config::ProviderConfig;
 use crate::ai::providers::{AiSuggestion, ConsistencyResult};
-use base64::Engine;
 
 /// 调用 OpenAI GPT-4V 进行一致性检查
 pub fn check_consistency_openai(

@@ -1,8 +1,10 @@
 use crate::ai::AiConfig;
+use crate::ai::config::ProviderConfig;
 use crate::db::DbState;
+use base64::Engine;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -87,21 +89,23 @@ pub async fn generate_pixel_art(
     project_id: String,
     params: TextToPixelParams,
 ) -> Result<Vec<GeneratedAsset>, String> {
-    let cfg = config.lock().map_err(|e| format!("配置锁失败: {}", e))?;
-    let provider_id = params.provider.as_deref()
-        .unwrap_or(&cfg.default_generation_provider)
-        .to_string();
+    let (provider_id, api_key, provider_config) = {
+        let cfg = config.lock().map_err(|e| format!("配置锁失败: {}", e))?;
+        let provider_id = params.provider.as_deref()
+            .unwrap_or(&cfg.default_generation_provider)
+            .to_string();
 
-    // 获取对应 provider 的 API key
-    let api_key = cfg.api_keys.get(&provider_id)
-        .ok_or(format!("未配置 {} API Key，请在 AI 设置中配置", provider_id))?
-        .clone();
+        let api_key = cfg.api_keys.get(&provider_id)
+            .ok_or(format!("未配置 {} API Key，请在 AI 设置中配置", provider_id))?
+            .clone();
 
-    let provider_config = cfg.providers.iter()
-        .find(|p| p.id == provider_id)
-        .ok_or(format!("未找到 Provider: {}", provider_id))?
-        .clone();
-    drop(cfg);
+        let provider_config = cfg.providers.iter()
+            .find(|p| p.id == provider_id)
+            .ok_or(format!("未找到 Provider: {}", provider_id))?
+            .clone();
+
+        (provider_id, api_key, provider_config)
+    }; // cfg 自动 drop
 
     let enhanced_prompt = build_pixel_prompt(&params);
     let mut results = Vec::new();
@@ -246,13 +250,13 @@ pub fn list_generated_assets(
                 style,
                 width,
                 height,
-                palette: palette_str.and_then(|s| serde_json::from_str(&s).ok()),
+                palette: palette_str.and_then(|s: String| serde_json::from_str::<Vec<String>>(&s).ok()),
                 seed: seed.map(|s| s as u64),
                 provider,
                 file_path,
                 thumbnail_path,
                 created_at,
-                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+                metadata: metadata_str.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
             })
         })
         .map_err(|e| format!("读取生成资产失败: {}", e))?
@@ -275,8 +279,7 @@ pub fn delete_generated_asset(db: State<'_, DbState>, asset_id: String) -> Resul
     // 删除文件
     let _ = std::fs::remove_file(&file_path);
     // 也尝试删除缩略图
-    let thumb_path = file_path.replace(".png", "").to_string();
-    let _ = std::fs::remove_file(format!("{}thumb_{}.png", 
+    let _ = std::fs::remove_file(format!("{}/thumb_{}.png",
         std::path::Path::new(&file_path).parent().unwrap_or(std::path::Path::new(".")).to_string_lossy(),
         asset_id
     ));
@@ -391,7 +394,7 @@ async fn generate_openai(
         .as_str()
         .ok_or("响应中缺少图片数据")?;
 
-    base64::decode(b64_data)
+    base64::engine::general_purpose::STANDARD.decode(b64_data)
         .map_err(|e| format!("解码图片失败: {}", e))
 }
 
@@ -448,6 +451,6 @@ fn generate_stability(
         .as_str()
         .ok_or("响应中缺少图片数据")?;
 
-    base64::decode(b64_data)
+    base64::engine::general_purpose::STANDARD.decode(b64_data)
         .map_err(|e| format!("解码图片失败: {}", e))
 }

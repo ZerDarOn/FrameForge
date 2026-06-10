@@ -516,16 +516,19 @@ pub fn export_gif(
         let src = Path::new(path);
         if !src.exists() { continue; }
 
-        let img = image::io::Reader::open(path)
+        let img = image::ImageReader::open(path)
             .map_err(|e| format!("打开帧 {} 失败: {}", i, e))?
             .decode()
             .map_err(|e| format!("解码帧 {} 失败: {}", i, e))?;
 
         let rgba = img.to_rgba8();
-        let mut frame = image::Frame::from(rgba);
-        frame.delay = image::Delay::from_numer_denom_ms(frame_delay_ms, 1);
+        let frame = image::Frame::from_parts(
+            rgba,
+            0, 0,
+            image::Delay::from_numer_denom_ms(frame_delay_ms, 1),
+        );
 
-        encoder.encode(&frame)
+        encoder.encode_frame(frame)
             .map_err(|e| format!("编码帧 {} 失败: {}", i, e))?;
     }
 

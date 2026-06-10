@@ -350,9 +350,6 @@ pub fn add_generated_to_timeline(
 
     Ok(tid)
 }
-
-use crate::ai::config::ProviderConfig;
-
 /// 调用 OpenAI DALL-E API
 async fn generate_openai(
     provider_config: &ProviderConfig,

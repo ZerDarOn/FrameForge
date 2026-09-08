@@ -11,6 +11,8 @@ import {
 } from "../../core/pixelImage";
 import {
   analyzePixelPalette,
+  applyPixelPalette,
+  reducePixelImagesPalette,
   reducePixelPalette,
   removeColorAsTransparency,
   type PaletteReductionResult,
@@ -34,6 +36,7 @@ type CleanupMode = "transparency" | "palette";
 type CleanupPreview = TransparencyCleanupResult | PaletteReductionResult;
 const MAX_EDITABLE_PIXELS = 4 * 1024 * 1024;
 const MAX_BATCH_CLEANUP_CELS = 64;
+const MAX_BATCH_PALETTE_PIXELS = 8 * 1024 * 1024;
 const PIXEL_TOOL_LABELS: Record<PixelTool, string> = {
   pencil: "铅笔",
   eraser: "橡皮",
@@ -142,6 +145,9 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
   const [batchProgress, setBatchProgress] = useState<{ completed: number; total: number } | null>(
     null,
   );
+  const [batchPalettePreviewSignature, setBatchPalettePreviewSignature] = useState<string | null>(
+    null,
+  );
   const selectedAssetIds = useTimelineStore((state) => state.selectedAssetIds);
   const documentState = useAnimationDocumentStore((state) => state.document);
   const animation = documentState?.animations[0];
@@ -160,7 +166,16 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       animation?.layers.find((candidateLayer) => candidateLayer.id === candidate.layerId)?.locked,
   );
   const batchCleanupRequested =
-    cleanupMode === "transparency" && applyToSelection && cleanupSelectionCels.length > 1;
+    applyToSelection && cleanupSelectionCels.length > 1;
+  const currentBatchPaletteSignature = documentState
+    ? [
+        documentState.projectId,
+        paletteSize,
+        ...cleanupSelectionCels
+          .map((candidate) => `${candidate.id}:${candidate.contentRevisionId}`)
+          .sort(),
+      ].join("|")
+    : "";
 
   const updateImage = useCallback((next: PixelImage) => {
     imageRef.current = next;
@@ -285,6 +300,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       setCleanupMode("transparency");
       setApplyToSelection(false);
       setBatchProgress(null);
+      setBatchPalettePreviewSignature(null);
       setCleanupPreview(null);
       setShowCleanupPreview(true);
       setCleanupOpen(true);
@@ -298,28 +314,161 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
   const handleCleanupColorChange = (value: string) => {
     setCleanupColor(value);
     setCleanupPreview(null);
+    setBatchPalettePreviewSignature(null);
   };
 
   const handleCleanupToleranceChange = (value: number) => {
     setCleanupTolerance(value);
     setCleanupPreview(null);
+    setBatchPalettePreviewSignature(null);
   };
 
   const handleCleanupModeChange = (value: CleanupMode) => {
     setCleanupMode(value);
-    if (value !== "transparency") setApplyToSelection(false);
     setCleanupPreview(null);
+    setBatchPalettePreviewSignature(null);
     setShowCleanupPreview(true);
   };
 
   const handlePaletteSizeChange = (value: number) => {
     setPaletteSize(value);
     setCleanupPreview(null);
+    setBatchPalettePreviewSignature(null);
   };
 
-  const handleCreateCleanupPreview = () => {
+  const handleApplyToSelectionChange = (checked: boolean) => {
+    setApplyToSelection(checked);
+    setCleanupPreview(null);
+    setBatchPalettePreviewSignature(null);
+  };
+
+  const handleCreateCleanupPreview = async () => {
     const current = imageRef.current;
     if (!current) return;
+    if (cleanupMode === "palette" && batchCleanupRequested) {
+      const sourceDocument = useAnimationDocumentStore.getState().document;
+      const sourceAnimation = sourceDocument?.animations[0];
+      const sourceCel = sourceAnimation?.cels.find(
+        (candidate) => candidate.id === (asset.documentCelId ?? asset.id),
+      );
+      if (!sourceDocument || !sourceAnimation || !sourceCel) {
+        setError("动画文档已切换，无法生成共享色板预览");
+        return;
+      }
+      const targetIds = new Set(useTimelineStore.getState().selectedAssetIds);
+      targetIds.add(sourceCel.id);
+      const targetCels = sourceAnimation.cels.filter((candidate) => targetIds.has(candidate.id));
+      const previewSignature = [
+        sourceDocument.projectId,
+        paletteSize,
+        ...targetCels
+          .map((candidate) => `${candidate.id}:${candidate.contentRevisionId}`)
+          .sort(),
+      ].join("|");
+      const layerById = new Map(
+        sourceAnimation.layers.map((candidate) => [candidate.id, candidate]),
+      );
+      if (targetCels.length > MAX_BATCH_CLEANUP_CELS) {
+        setError(`单次最多处理 ${MAX_BATCH_CLEANUP_CELS} 个画格`);
+        return;
+      }
+      if (targetCels.some((candidate) => layerById.get(candidate.layerId)?.locked)) {
+        setError("所选画格包含锁定图层，无法生成共享色板预览");
+        return;
+      }
+      const contentById = new Map(
+        sourceDocument.contentRevisions.map((candidate) => [candidate.id, candidate]),
+      );
+      const uniqueContents = new Map<string, ContentRevision>();
+      for (const targetCel of targetCels) {
+        const targetContent = contentById.get(targetCel.contentRevisionId);
+        if (!targetContent) {
+          setError(`画格 ${targetCel.id} 缺少内容版本`);
+          return;
+        }
+        uniqueContents.set(targetContent.id, targetContent);
+      }
+
+      console.info("[FrameForge] shared palette preview started", {
+        projectId: sourceDocument.projectId,
+        targetCelCount: targetCels.length,
+        uniqueContentCount: uniqueContents.size,
+        paletteSize,
+      });
+      setBusy(true);
+      setError(null);
+      setBatchProgress({ completed: 0, total: uniqueContents.size });
+      let outcome = "failed";
+      let totalPixels = 0;
+      try {
+        const orderedContents = [...uniqueContents.values()];
+        const images: PixelImage[] = [];
+        for (let index = 0; index < orderedContents.length; index += 1) {
+          const sourceContent = orderedContents[index];
+          const sourceImage =
+            sourceContent.id === sourceCel.contentRevisionId
+              ? current
+              : await invoke<ReadContentImage>("read_content_image", {
+                  filePath: sourceContent.sourcePath,
+                }).then((result) => decodePixelImage(result.pngDataUrl));
+          totalPixels += sourceImage.width * sourceImage.height;
+          if (totalPixels > MAX_BATCH_PALETTE_PIXELS) {
+            throw new Error("共享色板预览累计像素超过 8M 上限，请减少所选画格");
+          }
+          images.push(sourceImage);
+          setBatchProgress({ completed: index + 1, total: orderedContents.length });
+        }
+        const reduced = reducePixelImagesPalette(images, paletteSize);
+        const latestDocument = useAnimationDocumentStore.getState().document;
+        const latestAnimation = latestDocument?.animations.find(
+          (candidate) => candidate.id === sourceAnimation.id,
+        );
+        const latestTargetCels = targetCels.map((sourceTargetCel) =>
+          latestAnimation?.cels.find((candidate) => candidate.id === sourceTargetCel.id),
+        );
+        const latestSignature = latestDocument
+          ? [
+              latestDocument.projectId,
+              paletteSize,
+              ...latestTargetCels
+                .filter((candidate) => candidate !== undefined)
+                .map((candidate) => `${candidate.id}:${candidate.contentRevisionId}`)
+                .sort(),
+            ].join("|")
+          : "";
+        if (
+          latestTargetCels.some((candidate) => candidate === undefined) ||
+          latestSignature !== previewSignature
+        ) {
+          throw new Error("生成预览期间项目或画格内容已变化，请重试");
+        }
+        const currentIndex = orderedContents.findIndex(
+          (candidate) => candidate.id === sourceCel.contentRevisionId,
+        );
+        if (currentIndex < 0) throw new Error("当前画格不在共享色板范围内");
+        setCleanupPreview({
+          image: reduced.images[currentIndex],
+          changedPixels: reduced.changedPixels[currentIndex],
+          palette: reduced.palette,
+        });
+        setBatchPalettePreviewSignature(previewSignature);
+        setShowCleanupPreview(true);
+        outcome = "ready";
+      } catch (previewError) {
+        setCleanupPreview(null);
+        setBatchPalettePreviewSignature(null);
+        setError(describeError(previewError));
+      } finally {
+        console.info("[FrameForge] shared palette preview ended", {
+          projectId: sourceDocument.projectId,
+          outcome,
+          totalPixels,
+        });
+        setBusy(false);
+        setBatchProgress(null);
+      }
+      return;
+    }
     try {
       setCleanupPreview(
         cleanupMode === "transparency"
@@ -327,6 +476,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
           : reducePixelPalette(current, paletteSize),
       );
       setShowCleanupPreview(true);
+      setBatchPalettePreviewSignature(null);
       setError(null);
     } catch (previewError) {
       setError(describeError(previewError));
@@ -337,11 +487,12 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     setCleanupOpen(false);
     setApplyToSelection(false);
     setBatchProgress(null);
+    setBatchPalettePreviewSignature(null);
     setCleanupPreview(null);
     setPaletteAnalysis(null);
   };
 
-  const applyTransparencyCleanupToSelection = async () => {
+  const applyCleanupToSelection = async () => {
     const sourceDocument = useAnimationDocumentStore.getState().document;
     const sourceAnimation = sourceDocument?.animations[0];
     const sourceCel = sourceAnimation?.cels.find(
@@ -355,8 +506,24 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     const targetIds = new Set(useTimelineStore.getState().selectedAssetIds);
     targetIds.add(sourceCel.id);
     const targetCels = sourceAnimation.cels.filter((candidate) => targetIds.has(candidate.id));
+    const sourceBatchPaletteSignature = [
+      sourceDocument.projectId,
+      paletteSize,
+      ...targetCels
+        .map((candidate) => `${candidate.id}:${candidate.contentRevisionId}`)
+        .sort(),
+    ].join("|");
+    if (
+      cleanupMode === "palette" &&
+      (batchPalettePreviewSignature !== sourceBatchPaletteSignature ||
+        !cleanupPreview ||
+        !("palette" in cleanupPreview))
+    ) {
+      setError("所选画格或内容已变化，请重新生成共享色板预览");
+      return false;
+    }
     if (targetCels.length < 2) {
-      console.info("[FrameForge] batch transparency cleanup skipped", {
+      console.info("[FrameForge] batch pixel cleanup skipped", {
         projectId: sourceDocument.projectId,
         targetCelCount: targetCels.length,
         reason: "insufficient-selection",
@@ -365,7 +532,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       return false;
     }
     if (targetCels.length > MAX_BATCH_CLEANUP_CELS) {
-      console.info("[FrameForge] batch transparency cleanup skipped", {
+      console.info("[FrameForge] batch pixel cleanup skipped", {
         projectId: sourceDocument.projectId,
         targetCelCount: targetCels.length,
         reason: "selection-limit",
@@ -375,7 +542,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     }
     const layerById = new Map(sourceAnimation.layers.map((candidate) => [candidate.id, candidate]));
     if (targetCels.some((candidate) => layerById.get(candidate.layerId)?.locked)) {
-      console.info("[FrameForge] batch transparency cleanup skipped", {
+      console.info("[FrameForge] batch pixel cleanup skipped", {
         projectId: sourceDocument.projectId,
         targetCelCount: targetCels.length,
         reason: "locked-layer",
@@ -401,9 +568,10 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       projectId: sourceDocument.projectId,
       targetCelCount: targetCels.length,
       uniqueContentCount: uniqueContents.size,
-      tolerance: cleanupTolerance,
+      mode: cleanupMode,
+      parameter: cleanupMode === "transparency" ? cleanupTolerance : paletteSize,
     };
-    console.info("[FrameForge] batch transparency cleanup started", logContext);
+    console.info("[FrameForge] batch pixel cleanup started", logContext);
     commitInFlightRef.current = true;
     setBusy(true);
     setError(null);
@@ -414,6 +582,10 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
 
     try {
       const targetColor = colorFromHex(cleanupColor);
+      const sharedPalette =
+        cleanupMode === "palette" && cleanupPreview && "palette" in cleanupPreview
+          ? cleanupPreview.palette
+          : null;
       const preparedByContentId = new Map<string, ContentRevision>();
       let currentPreparedImage: PixelImage | null = null;
       let completed = 0;
@@ -425,11 +597,10 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                 filePath: sourceContent.sourcePath,
               }).then((result) => decodePixelImage(result.pngDataUrl));
         if (!sourceImage) throw new Error("当前画格图片尚未加载完成");
-        const cleaned = removeColorAsTransparency(
-          sourceImage,
-          targetColor,
-          cleanupTolerance,
-        );
+        const cleaned =
+          cleanupMode === "transparency"
+            ? removeColorAsTransparency(sourceImage, targetColor, cleanupTolerance)
+            : applyPixelPalette(sourceImage, sharedPalette ?? []);
         if (cleaned.changedPixels > 0) {
           const revisionId = crypto.randomUUID();
           const written = await invoke<WrittenContentRevision>("write_content_revision", {
@@ -463,7 +634,11 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       changedCelCount = entries.length;
       if (entries.length === 0) {
         outcome = "no-op";
-        setError("所选画格中没有匹配目标颜色的像素");
+        setError(
+          cleanupMode === "transparency"
+            ? "所选画格中没有匹配目标颜色的像素"
+            : "所选画格已经符合目标共享色板",
+        );
         return false;
       }
 
@@ -506,7 +681,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       setError(describeError(batchError));
       return false;
     } finally {
-      console.info("[FrameForge] batch transparency cleanup ended", {
+      console.info("[FrameForge] batch pixel cleanup ended", {
         ...logContext,
         outcome,
         preparedRevisionCount,
@@ -531,7 +706,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       return;
     }
     if (batchCleanupRequested) {
-      const applied = await applyTransparencyCleanupToSelection();
+      const applied = await applyCleanupToSelection();
       if (applied) handleCloseCleanup();
       return;
     }
@@ -886,6 +1061,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                   : "bg-gray-800 text-gray-400"
               }`}
               onClick={() => handleCleanupModeChange("transparency")}
+              disabled={busy}
             >
               透明色
             </button>
@@ -897,6 +1073,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                   : "bg-gray-800 text-gray-400"
               }`}
               onClick={() => handleCleanupModeChange("palette")}
+              disabled={busy}
             >
               压缩颜色
             </button>
@@ -935,6 +1112,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                   value={cleanupColor}
                   onChange={(event) => handleCleanupColorChange(event.target.value)}
                   className="h-7 w-10 rounded border border-gray-600 bg-transparent"
+                  disabled={busy}
                 />
                 <span>{cleanupColor.toUpperCase()}</span>
               </label>
@@ -954,6 +1132,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                     handleCleanupToleranceChange(Number(event.target.value))
                   }
                   className="w-full accent-orange-500"
+                  disabled={busy}
                 />
               </label>
 
@@ -963,7 +1142,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                     <input
                       type="checkbox"
                       checked={applyToSelection}
-                      onChange={(event) => setApplyToSelection(event.target.checked)}
+                      onChange={(event) => handleApplyToSelectionChange(event.target.checked)}
                       disabled={busy}
                       className="mt-0.5 accent-orange-500"
                     />
@@ -988,38 +1167,79 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
               )}
             </>
           ) : (
-            <label className="mb-3 block text-xs text-gray-400">
-              <span className="mb-1 flex justify-between">
-                <span>目标颜色数</span>
-                <span>{paletteSize}</span>
-              </span>
-              <input
-                type="range"
-                min="2"
-                max="32"
-                step="1"
-                value={paletteSize}
-                onChange={(event) => handlePaletteSizeChange(Number(event.target.value))}
-                className="w-full accent-orange-500"
-              />
-            </label>
+            <>
+              <label className="mb-3 block text-xs text-gray-400">
+                <span className="mb-1 flex justify-between">
+                  <span>目标颜色数</span>
+                  <span>{paletteSize}</span>
+                </span>
+                <input
+                  type="range"
+                  min="2"
+                  max="32"
+                  step="1"
+                  value={paletteSize}
+                  onChange={(event) => handlePaletteSizeChange(Number(event.target.value))}
+                  className="w-full accent-orange-500"
+                  disabled={busy}
+                />
+              </label>
+
+              {cleanupSelectionCels.length > 1 && (
+                <div className="mb-3 rounded border border-gray-700 bg-gray-800/70 p-2">
+                  <label className="flex items-start gap-2 text-xs text-gray-300">
+                    <input
+                      type="checkbox"
+                      checked={applyToSelection}
+                      onChange={(event) => handleApplyToSelectionChange(event.target.checked)}
+                      disabled={busy}
+                      className="mt-0.5 accent-orange-500"
+                    />
+                    <span>
+                      共享色板应用到 {cleanupSelectionCels.length} 个画格
+                      <span className="mt-1 block text-[11px] leading-4 text-gray-500">
+                        预览会分析全部所选画格，累计最多 8M 像素，并在每帧使用同一套色板。
+                      </span>
+                    </span>
+                  </label>
+                  {cleanupSelectionCels.length > MAX_BATCH_CLEANUP_CELS && (
+                    <div className="mt-2 text-[11px] text-red-400">
+                      单次最多处理 {MAX_BATCH_CLEANUP_CELS} 个画格
+                    </div>
+                  )}
+                  {cleanupSelectionHasLockedLayer && (
+                    <div className="mt-2 text-[11px] text-amber-400">
+                      选择中包含锁定图层，批量应用将被拒绝
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
           )}
 
           <button
             type="button"
             className="mb-3 w-full rounded bg-gray-700 px-3 py-2 text-xs text-white hover:bg-gray-600"
-            onClick={handleCreateCleanupPreview}
+            onClick={() => void handleCreateCleanupPreview()}
             disabled={busy}
           >
             {cleanupMode === "transparency" ? "生成透明预览" : "生成压色预览"}
           </button>
+
+          {batchProgress && (
+            <div className="mb-3 rounded bg-gray-800 px-3 py-2 text-xs text-cyan-300">
+              正在处理内容 {batchProgress.completed}/{batchProgress.total}
+            </div>
+          )}
 
           {cleanupPreview && (
             <div className="space-y-3">
               <div className="rounded bg-gray-800 px-3 py-2 text-xs text-gray-300">
                 {cleanupMode === "transparency"
                   ? `将清除 ${cleanupPreview.changedPixels} 个像素`
-                  : `将调整 ${cleanupPreview.changedPixels} 个像素`}
+                  : batchCleanupRequested
+                    ? `当前画格将调整 ${cleanupPreview.changedPixels} 个像素`
+                    : `将调整 ${cleanupPreview.changedPixels} 个像素`}
               </div>
               {"palette" in cleanupPreview && cleanupPreview.palette.length > 0 && (
                 <div>
@@ -1041,11 +1261,13 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                   </div>
                 </div>
               )}
-              {batchProgress && (
-                <div className="rounded bg-gray-800 px-3 py-2 text-xs text-cyan-300">
-                  正在处理内容 {batchProgress.completed}/{batchProgress.total}
-                </div>
-              )}
+              {batchCleanupRequested &&
+                cleanupMode === "palette" &&
+                batchPalettePreviewSignature !== currentBatchPaletteSignature && (
+                  <div className="rounded bg-amber-950 px-3 py-2 text-xs text-amber-300">
+                    所选画格或内容已变化，请重新生成共享色板预览
+                  </div>
+                )}
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
@@ -1075,7 +1297,9 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                   layer?.locked ||
                   (batchCleanupRequested &&
                     (cleanupSelectionHasLockedLayer ||
-                      cleanupSelectionCels.length > MAX_BATCH_CLEANUP_CELS)) ||
+                      cleanupSelectionCels.length > MAX_BATCH_CLEANUP_CELS ||
+                      (cleanupMode === "palette" &&
+                        batchPalettePreviewSignature !== currentBatchPaletteSignature))) ||
                   (cleanupPreview.changedPixels === 0 && !batchCleanupRequested)
                 }
               >

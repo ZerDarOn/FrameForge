@@ -25,6 +25,13 @@ export interface PaletteReductionResult extends TransparencyCleanupResult {
   palette: RgbaColor[];
 }
 
+export interface SharedPaletteReductionResult {
+  images: PixelImage[];
+  changedPixels: number[];
+  totalChangedPixels: number;
+  palette: RgbaColor[];
+}
+
 interface ColorSample {
   key: number;
   red: number;
@@ -211,11 +218,7 @@ export function removeColorAsTransparency(
   };
 }
 
-export function reducePixelPalette(
-  image: PixelImage,
-  maxColors: number,
-): PaletteReductionResult {
-  assertPixelImage(image);
+function assertReducedPaletteSize(maxColors: number) {
   if (
     !Number.isInteger(maxColors) ||
     maxColors < 2 ||
@@ -225,52 +228,55 @@ export function reducePixelPalette(
       `maxColors must be an integer between 2 and ${MAX_REDUCED_PALETTE_COLORS}`,
     );
   }
+}
 
+function createPalettePlan(images: PixelImage[], maxColors: number) {
   const exactColors = new Set<number>();
   const buckets = new Map<number, ColorSample>();
-  for (let index = 0; index < image.data.length; index += 4) {
-    if (image.data[index + 3] === 0) continue;
-    const red = image.data[index];
-    const green = image.data[index + 1];
-    const blue = image.data[index + 2];
-    if (exactColors.size <= maxColors) exactColors.add(rgbKey(red, green, blue));
+  for (const image of images) {
+    for (let index = 0; index < image.data.length; index += 4) {
+      if (image.data[index + 3] === 0) continue;
+      const red = image.data[index];
+      const green = image.data[index + 1];
+      const blue = image.data[index + 2];
+      if (exactColors.size <= maxColors) exactColors.add(rgbKey(red, green, blue));
 
-    const key = ((red >> 3) << 10) | ((green >> 3) << 5) | (blue >> 3);
-    const bucket = buckets.get(key);
-    if (bucket) {
-      bucket.redSum += red;
-      bucket.greenSum += green;
-      bucket.blueSum += blue;
-      bucket.count += 1;
-      bucket.red = Math.round(bucket.redSum / bucket.count);
-      bucket.green = Math.round(bucket.greenSum / bucket.count);
-      bucket.blue = Math.round(bucket.blueSum / bucket.count);
-    } else {
-      buckets.set(key, {
-        key,
-        red,
-        green,
-        blue,
-        redSum: red,
-        greenSum: green,
-        blueSum: blue,
-        count: 1,
-      });
+      const key = ((red >> 3) << 10) | ((green >> 3) << 5) | (blue >> 3);
+      const bucket = buckets.get(key);
+      if (bucket) {
+        bucket.redSum += red;
+        bucket.greenSum += green;
+        bucket.blueSum += blue;
+        bucket.count += 1;
+        bucket.red = Math.round(bucket.redSum / bucket.count);
+        bucket.green = Math.round(bucket.greenSum / bucket.count);
+        bucket.blue = Math.round(bucket.blueSum / bucket.count);
+      } else {
+        buckets.set(key, {
+          key,
+          red,
+          green,
+          blue,
+          redSum: red,
+          greenSum: green,
+          blueSum: blue,
+          count: 1,
+        });
+      }
     }
   }
 
   if (exactColors.size <= maxColors) {
     return {
-      image,
-      changedPixels: 0,
       palette: [...exactColors]
         .sort((left, right) => left - right)
-        .map((key) => [
+        .map<RgbaColor>((key) => [
           (key >>> 16) & 0xff,
           (key >>> 8) & 0xff,
           key & 0xff,
           255,
         ]),
+      requiresReduction: false,
     };
   }
 
@@ -295,23 +301,22 @@ export function reducePixelPalette(
           rgbKey(colors[index - 1][0], colors[index - 1][1], colors[index - 1][2]),
     );
 
-  const paletteByBucket = new Map<number, RgbaColor>();
-  for (const sample of buckets.values()) {
-    let closest = palette[0];
-    let closestDistance = Number.POSITIVE_INFINITY;
-    for (const candidate of palette) {
-      const distance =
-        (sample.red - candidate[0]) ** 2 +
-        (sample.green - candidate[1]) ** 2 +
-        (sample.blue - candidate[2]) ** 2;
-      if (distance < closestDistance) {
-        closest = candidate;
-        closestDistance = distance;
-      }
-    }
-    paletteByBucket.set(sample.key, closest);
-  }
+  return { palette, requiresReduction: true };
+}
 
+export function applyPixelPalette(
+  image: PixelImage,
+  palette: RgbaColor[],
+) {
+  assertPixelImage(image);
+  if (palette.length < 1 || palette.length > MAX_REDUCED_PALETTE_COLORS) {
+    throw new Error(`palette must contain between 1 and ${MAX_REDUCED_PALETTE_COLORS} colors`);
+  }
+  palette.forEach(assertColor);
+  const paletteByExactRgb = new Map(
+    palette.map((color) => [rgbKey(color[0], color[1], color[2]), color]),
+  );
+  const paletteByBucket = new Map<number, RgbaColor>();
   const data = new Uint8ClampedArray(image.data);
   let changedPixels = 0;
   for (let index = 0; index < data.length; index += 4) {
@@ -319,9 +324,27 @@ export function reducePixelPalette(
     const red = data[index];
     const green = data[index + 1];
     const blue = data[index + 2];
+    const exactKey = rgbKey(red, green, blue);
     const key = ((red >> 3) << 10) | ((green >> 3) << 5) | (blue >> 3);
-    const closest = paletteByBucket.get(key);
-    if (!closest) throw new Error("Palette reduction bucket was not initialized");
+    let closest = paletteByExactRgb.get(exactKey) ?? paletteByBucket.get(key);
+    if (!closest) {
+      const bucketRed = ((key >>> 10) & 0x1f) * 8 + 3.5;
+      const bucketGreen = ((key >>> 5) & 0x1f) * 8 + 3.5;
+      const bucketBlue = (key & 0x1f) * 8 + 3.5;
+      let closestDistance = Number.POSITIVE_INFINITY;
+      for (const candidate of palette) {
+        const distance =
+          (bucketRed - candidate[0]) ** 2 +
+          (bucketGreen - candidate[1]) ** 2 +
+          (bucketBlue - candidate[2]) ** 2;
+        if (distance < closestDistance) {
+          closest = candidate;
+          closestDistance = distance;
+        }
+      }
+      if (!closest) throw new Error("Palette is empty");
+      paletteByBucket.set(key, closest);
+    }
     if (red !== closest[0] || green !== closest[1] || blue !== closest[2]) {
       data[index] = closest[0];
       data[index + 1] = closest[1];
@@ -333,6 +356,43 @@ export function reducePixelPalette(
   return {
     image: changedPixels > 0 ? { ...image, data } : image,
     changedPixels,
-    palette,
+  };
+}
+
+export function reducePixelImagesPalette(
+  images: PixelImage[],
+  maxColors: number,
+): SharedPaletteReductionResult {
+  if (images.length === 0) throw new Error("at least one image is required");
+  assertReducedPaletteSize(maxColors);
+  images.forEach(assertPixelImage);
+  const plan = createPalettePlan(images, maxColors);
+  if (!plan.requiresReduction) {
+    return {
+      images,
+      changedPixels: images.map(() => 0),
+      totalChangedPixels: 0,
+      palette: plan.palette,
+    };
+  }
+  const reduced = images.map((image) => applyPixelPalette(image, plan.palette));
+  const changedPixels = reduced.map((result) => result.changedPixels);
+  return {
+    images: reduced.map((result) => result.image),
+    changedPixels,
+    totalChangedPixels: changedPixels.reduce((sum, count) => sum + count, 0),
+    palette: plan.palette,
+  };
+}
+
+export function reducePixelPalette(
+  image: PixelImage,
+  maxColors: number,
+): PaletteReductionResult {
+  const reduced = reducePixelImagesPalette([image], maxColors);
+  return {
+    image: reduced.images[0],
+    changedPixels: reduced.changedPixels[0],
+    palette: reduced.palette,
   };
 }

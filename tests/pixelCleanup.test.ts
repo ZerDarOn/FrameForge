@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   analyzePixelPalette,
+  applyPixelPalette,
+  reducePixelImagesPalette,
   reducePixelPalette,
   removeColorAsTransparency,
 } from "../src/core/pixelCleanup.ts";
@@ -111,4 +113,42 @@ test("palette reduction is a no-op when the requested palette already fits", () 
   ]);
   assert.throws(() => reducePixelPalette(source, 1), /maxColors/);
   assert.throws(() => reducePixelPalette(source, 33), /maxColors/);
+});
+
+test("multiple images use one shared reduced palette", () => {
+  const first = image(2, 1, [0, 0, 0, 255, 64, 64, 64, 128]);
+  const second = image(3, 1, [
+    192, 192, 192, 255,
+    255, 255, 255, 64,
+    20, 40, 60, 0,
+  ]);
+
+  const result = reducePixelImagesPalette([first, second], 2);
+
+  assert.deepEqual(result.palette, [
+    [32, 32, 32, 255],
+    [224, 224, 224, 255],
+  ]);
+  assert.deepEqual(result.changedPixels, [2, 2]);
+  assert.equal(result.totalChangedPixels, 4);
+  assert.deepEqual([...result.images[0].data], [32, 32, 32, 255, 32, 32, 32, 128]);
+  assert.deepEqual([...result.images[1].data], [
+    224, 224, 224, 255,
+    224, 224, 224, 64,
+    20, 40, 60, 0,
+  ]);
+  assert.deepEqual([...first.data], [0, 0, 0, 255, 64, 64, 64, 128]);
+  assert.throws(() => reducePixelImagesPalette([], 2), /at least one image/);
+});
+
+test("applying a fixed palette preserves exact colors that share one RGB bucket", () => {
+  const source = image(2, 1, [1, 1, 1, 255, 2, 2, 2, 128]);
+
+  const result = applyPixelPalette(source, [
+    [1, 1, 1, 255],
+    [2, 2, 2, 255],
+  ]);
+
+  assert.equal(result.image, source);
+  assert.equal(result.changedPixels, 0);
 });

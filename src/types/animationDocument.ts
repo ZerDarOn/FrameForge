@@ -145,6 +145,14 @@ export type AnimationDocumentCommand =
       contentRevision: ContentRevision;
     }
   | {
+      type: "set_cel_contents";
+      animationId: string;
+      entries: Array<{
+        celId: string;
+        contentRevision: ContentRevision;
+      }>;
+    }
+  | {
       type: "restore_cel";
       animationId: string;
       cel: AnimationCel;

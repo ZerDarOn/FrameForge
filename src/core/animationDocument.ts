@@ -700,6 +700,86 @@ export function applyAnimationDocumentCommand(
     };
   }
 
+  if (command.type === "set_cel_contents") {
+    if (command.entries.length === 0) {
+      throw new Error("Batch cel content command requires at least one entry");
+    }
+    const seenCelIds = new Set<string>();
+    const contentById = new Map(
+      document.contentRevisions.map((contentRevision) => [contentRevision.id, contentRevision]),
+    );
+    const pendingContentById = new Map<string, ContentRevision>();
+    const previousEntries = command.entries.map((entry) => {
+      if (seenCelIds.has(entry.celId)) {
+        throw new Error(`Duplicate cel content entry: ${entry.celId}`);
+      }
+      seenCelIds.add(entry.celId);
+      const cel = animation.cels.find((candidate) => candidate.id === entry.celId);
+      if (!cel) throw new Error(`Cel not found: ${entry.celId}`);
+      const layer = animation.layers.find((candidate) => candidate.id === cel.layerId);
+      if (layer?.locked) throw new Error(`Layer is locked: ${layer.id}`);
+      const previousContent = contentById.get(cel.contentRevisionId);
+      if (!previousContent) {
+        throw new Error(`Content revision not found: ${cel.contentRevisionId}`);
+      }
+      const nextContent = entry.contentRevision;
+      if (
+        !nextContent.id ||
+        nextContent.materialId !== previousContent.materialId ||
+        !nextContent.sourcePath ||
+        !Number.isInteger(nextContent.width) ||
+        nextContent.width <= 0 ||
+        !Number.isInteger(nextContent.height) ||
+        nextContent.height <= 0 ||
+        !Number.isFinite(nextContent.createdAt)
+      ) {
+        throw new Error("Content revision is invalid or belongs to another material");
+      }
+      const existingContent = contentById.get(nextContent.id) ?? pendingContentById.get(nextContent.id);
+      if (
+        existingContent &&
+        (existingContent.materialId !== nextContent.materialId ||
+          existingContent.sourcePath !== nextContent.sourcePath ||
+          existingContent.width !== nextContent.width ||
+          existingContent.height !== nextContent.height ||
+          existingContent.createdAt !== nextContent.createdAt)
+      ) {
+        throw new Error(`Content revision id collision: ${nextContent.id}`);
+      }
+      pendingContentById.set(nextContent.id, nextContent);
+      return { celId: cel.id, contentRevision: previousContent };
+    });
+    const nextContentIdByCelId = new Map(
+      command.entries.map((entry) => [entry.celId, entry.contentRevision.id]),
+    );
+    const addedContent = [...pendingContentById.values()].filter(
+      (contentRevision) => !contentById.has(contentRevision.id),
+    );
+    return {
+      document: {
+        ...document,
+        revision: document.revision + 1,
+        contentRevisions: [...document.contentRevisions, ...addedContent],
+        animations: document.animations.map((candidate) =>
+          candidate.id === animation.id
+            ? {
+                ...candidate,
+                cels: candidate.cels.map((cel) => {
+                  const contentRevisionId = nextContentIdByCelId.get(cel.id);
+                  return contentRevisionId ? { ...cel, contentRevisionId } : cel;
+                }),
+              }
+            : candidate,
+        ),
+      },
+      inverse: {
+        type: "set_cel_contents",
+        animationId: animation.id,
+        entries: previousEntries,
+      },
+    };
+  }
+
   if (animation.cels.some((candidate) => candidate.id === command.cel.id)) {
     throw new Error(`Cel already exists: ${command.cel.id}`);
   }

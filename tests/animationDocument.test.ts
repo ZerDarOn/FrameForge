@@ -319,6 +319,81 @@ test("content revisions are immutable and cel content changes are reversible", (
   assert.ok(undone.document.contentRevisions.some((candidate) => candidate.id === next.id));
 });
 
+test("batch cel content changes update and undo as one document revision", () => {
+  const document = convertLegacyProject(project, tracks, 100).document;
+  const animation = document.animations[0];
+  const cels = [animation.cels[0], animation.cels.at(-1)!];
+  const previous = new Map(
+    document.contentRevisions.map((content) => [content.id, content]),
+  );
+  const entries = cels.map((cel, index) => {
+    const content = previous.get(cel.contentRevisionId)!;
+    return {
+      celId: cel.id,
+      contentRevision: {
+        ...content,
+        id: `batch-content-${index}`,
+        sourcePath: `C:/project/revisions/batch-content-${index}.png`,
+        createdAt: content.createdAt + index + 1,
+      },
+    };
+  });
+
+  const applied = applyAnimationDocumentCommand(document, {
+    type: "set_cel_contents",
+    animationId: animation.id,
+    entries,
+  });
+
+  assert.equal(applied.document.revision, document.revision + 1);
+  assert.deepEqual(
+    applied.document.animations[0].cels
+      .filter((cel) => cels.some((selected) => selected.id === cel.id))
+      .map((cel) => cel.contentRevisionId),
+    entries.map((entry) => entry.contentRevision.id),
+  );
+  const undone = applyAnimationDocumentCommand(applied.document, applied.inverse);
+  assert.deepEqual(
+    undone.document.animations[0].cels
+      .filter((cel) => cels.some((selected) => selected.id === cel.id))
+      .map((cel) => cel.contentRevisionId),
+    cels.map((cel) => cel.contentRevisionId),
+  );
+});
+
+test("batch cel content changes reject the whole command when one layer is locked", () => {
+  const document = convertLegacyProject(project, tracks, 100).document;
+  const animation = document.animations[0];
+  const cels = [animation.cels[0], animation.cels.at(-1)!];
+  const lockedDocument = {
+    ...document,
+    animations: document.animations.map((candidate) => ({
+      ...candidate,
+      layers: candidate.layers.map((layer) =>
+        layer.id === cels[1].layerId ? { ...layer, locked: true } : layer,
+      ),
+    })),
+  };
+
+  assert.throws(
+    () =>
+      applyAnimationDocumentCommand(lockedDocument, {
+        type: "set_cel_contents",
+        animationId: animation.id,
+        entries: cels.map((cel, index) => ({
+          celId: cel.id,
+          contentRevision: {
+            ...document.contentRevisions.find(
+              (content) => content.id === cel.contentRevisionId,
+            )!,
+            id: `locked-batch-content-${index}`,
+          },
+        })),
+      }),
+    /locked/,
+  );
+});
+
 test("legacy structural adapter keeps immutable content history", () => {
   const document = convertLegacyProject(project, tracks, 100).document;
   const animation = document.animations[0];

@@ -257,3 +257,58 @@ test("content edit undo redo persists and survives reopening", async () => {
   assert.equal(store.getState().document!.animations[0].cels[0].contentRevisionId, "edited-content");
   assert.equal(store.getState().saveStatus, "saved");
 });
+
+test("batch content edit creates one history entry and one persisted revision", async () => {
+  const backend = new FakeDocumentBackend();
+  const projectValue = project("batch-content-save");
+  const firstTrack = trackWithAsset(projectValue.id);
+  const tracks = [
+    {
+      ...firstTrack,
+      assets: [
+        ...firstTrack.assets,
+        {
+          ...firstTrack.assets[0],
+          id: "asset-2",
+          name: "Frame 2",
+          sourcePath: "C:/fixture/original-2.png",
+          thumbnailPath: "C:/fixture/original-2.png",
+          startFrame: 1,
+        },
+      ],
+    },
+  ];
+  const initial = convertLegacyProject(projectValue, tracks, 1).document;
+  backend.records.set(projectValue.id, recordFor(initial));
+  const store = createAnimationDocumentStore(backend.invoke);
+  await store.getState().loadForProject(projectValue, tracks);
+  const animation = store.getState().document!.animations[0];
+  const contentById = new Map(
+    store.getState().document!.contentRevisions.map((content) => [content.id, content]),
+  );
+
+  store.getState().execute({
+    type: "set_cel_contents",
+    animationId: animation.id,
+    entries: animation.cels.map((cel, index) => ({
+      celId: cel.id,
+      contentRevision: {
+        ...contentById.get(cel.contentRevisionId)!,
+        id: `batch-edited-${index}`,
+        sourcePath: `C:/fixture/batch-edited-${index}.png`,
+        createdAt: 2,
+      },
+    })),
+  });
+
+  assert.equal(store.getState().undoStack.length, 1);
+  assert.equal(await store.getState().flushCurrentProject(), true);
+  assert.deepEqual(backend.saves.map((save) => save.revision), [1]);
+  assert.deepEqual(
+    store.getState().document!.animations[0].cels.map((cel) => cel.contentRevisionId),
+    ["batch-edited-0", "batch-edited-1"],
+  );
+  store.getState().undo();
+  assert.equal(await store.getState().flushCurrentProject(), true);
+  assert.deepEqual(backend.saves.map((save) => save.revision), [1, 2]);
+});

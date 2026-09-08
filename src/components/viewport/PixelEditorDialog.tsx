@@ -18,7 +18,9 @@ import {
   type TransparencyCleanupResult,
 } from "../../core/pixelCleanup";
 import { useAnimationDocumentStore } from "../../stores/animationDocumentStore";
+import { useTimelineStore } from "../../stores/timelineStore";
 import type { Asset } from "../../types/asset";
+import type { ContentRevision } from "../../types/animationDocument";
 import type {
   PixelClipboard,
   PixelImage,
@@ -31,6 +33,7 @@ type PixelTool = "pencil" | "eraser" | "fill" | "eyedropper" | "selection";
 type CleanupMode = "transparency" | "palette";
 type CleanupPreview = TransparencyCleanupResult | PaletteReductionResult;
 const MAX_EDITABLE_PIXELS = 4 * 1024 * 1024;
+const MAX_BATCH_CLEANUP_CELS = 64;
 const PIXEL_TOOL_LABELS: Record<PixelTool, string> = {
   pencil: "铅笔",
   eraser: "橡皮",
@@ -135,6 +138,11 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
   const [paletteAnalysis, setPaletteAnalysis] = useState<PixelPaletteAnalysis | null>(null);
   const [cleanupPreview, setCleanupPreview] = useState<CleanupPreview | null>(null);
   const [showCleanupPreview, setShowCleanupPreview] = useState(true);
+  const [applyToSelection, setApplyToSelection] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ completed: number; total: number } | null>(
+    null,
+  );
+  const selectedAssetIds = useTimelineStore((state) => state.selectedAssetIds);
   const documentState = useAnimationDocumentStore((state) => state.document);
   const animation = documentState?.animations[0];
   const cel = animation?.cels.find(
@@ -144,6 +152,15 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     (candidate) => candidate.id === cel?.contentRevisionId,
   );
   const layer = animation?.layers.find((candidate) => candidate.id === cel?.layerId);
+  const cleanupSelectionIds = new Set([cel?.id, ...selectedAssetIds].filter(Boolean));
+  const cleanupSelectionCels =
+    animation?.cels.filter((candidate) => cleanupSelectionIds.has(candidate.id)) ?? [];
+  const cleanupSelectionHasLockedLayer = cleanupSelectionCels.some(
+    (candidate) =>
+      animation?.layers.find((candidateLayer) => candidateLayer.id === candidate.layerId)?.locked,
+  );
+  const batchCleanupRequested =
+    cleanupMode === "transparency" && applyToSelection && cleanupSelectionCels.length > 1;
 
   const updateImage = useCallback((next: PixelImage) => {
     imageRef.current = next;
@@ -266,6 +283,8 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       setCleanupTolerance(0);
       setPaletteSize(Math.max(2, Math.min(16, analysis.uniqueColorCount ?? 16)));
       setCleanupMode("transparency");
+      setApplyToSelection(false);
+      setBatchProgress(null);
       setCleanupPreview(null);
       setShowCleanupPreview(true);
       setCleanupOpen(true);
@@ -288,6 +307,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
 
   const handleCleanupModeChange = (value: CleanupMode) => {
     setCleanupMode(value);
+    if (value !== "transparency") setApplyToSelection(false);
     setCleanupPreview(null);
     setShowCleanupPreview(true);
   };
@@ -315,8 +335,187 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
 
   const handleCloseCleanup = () => {
     setCleanupOpen(false);
+    setApplyToSelection(false);
+    setBatchProgress(null);
     setCleanupPreview(null);
     setPaletteAnalysis(null);
+  };
+
+  const applyTransparencyCleanupToSelection = async () => {
+    const sourceDocument = useAnimationDocumentStore.getState().document;
+    const sourceAnimation = sourceDocument?.animations[0];
+    const sourceCel = sourceAnimation?.cels.find(
+      (candidate) => candidate.id === (asset.documentCelId ?? asset.id),
+    );
+    if (!sourceDocument || !sourceAnimation || !sourceCel || !imageRef.current) {
+      setError("动画文档已切换，无法执行批量清理");
+      return false;
+    }
+
+    const targetIds = new Set(useTimelineStore.getState().selectedAssetIds);
+    targetIds.add(sourceCel.id);
+    const targetCels = sourceAnimation.cels.filter((candidate) => targetIds.has(candidate.id));
+    if (targetCels.length < 2) {
+      console.info("[FrameForge] batch transparency cleanup skipped", {
+        projectId: sourceDocument.projectId,
+        targetCelCount: targetCels.length,
+        reason: "insufficient-selection",
+      });
+      setError("请先在时间线中选择至少两个画格");
+      return false;
+    }
+    if (targetCels.length > MAX_BATCH_CLEANUP_CELS) {
+      console.info("[FrameForge] batch transparency cleanup skipped", {
+        projectId: sourceDocument.projectId,
+        targetCelCount: targetCels.length,
+        reason: "selection-limit",
+      });
+      setError(`单次最多清理 ${MAX_BATCH_CLEANUP_CELS} 个画格`);
+      return false;
+    }
+    const layerById = new Map(sourceAnimation.layers.map((candidate) => [candidate.id, candidate]));
+    if (targetCels.some((candidate) => layerById.get(candidate.layerId)?.locked)) {
+      console.info("[FrameForge] batch transparency cleanup skipped", {
+        projectId: sourceDocument.projectId,
+        targetCelCount: targetCels.length,
+        reason: "locked-layer",
+      });
+      setError("所选画格包含锁定图层，批量清理已取消");
+      return false;
+    }
+
+    const contentById = new Map(
+      sourceDocument.contentRevisions.map((candidate) => [candidate.id, candidate]),
+    );
+    const uniqueContents = new Map<string, ContentRevision>();
+    for (const targetCel of targetCels) {
+      const targetContent = contentById.get(targetCel.contentRevisionId);
+      if (!targetContent) {
+        setError(`画格 ${targetCel.id} 缺少内容版本，批量清理已取消`);
+        return false;
+      }
+      uniqueContents.set(targetContent.id, targetContent);
+    }
+
+    const logContext = {
+      projectId: sourceDocument.projectId,
+      targetCelCount: targetCels.length,
+      uniqueContentCount: uniqueContents.size,
+      tolerance: cleanupTolerance,
+    };
+    console.info("[FrameForge] batch transparency cleanup started", logContext);
+    commitInFlightRef.current = true;
+    setBusy(true);
+    setError(null);
+    setBatchProgress({ completed: 0, total: uniqueContents.size });
+    let outcome = "failed";
+    let preparedRevisionCount = 0;
+    let changedCelCount = 0;
+
+    try {
+      const targetColor = colorFromHex(cleanupColor);
+      const preparedByContentId = new Map<string, ContentRevision>();
+      let currentPreparedImage: PixelImage | null = null;
+      let completed = 0;
+      for (const sourceContent of uniqueContents.values()) {
+        const sourceImage =
+          sourceContent.id === sourceCel.contentRevisionId
+            ? imageRef.current
+            : await invoke<ReadContentImage>("read_content_image", {
+                filePath: sourceContent.sourcePath,
+              }).then((result) => decodePixelImage(result.pngDataUrl));
+        if (!sourceImage) throw new Error("当前画格图片尚未加载完成");
+        const cleaned = removeColorAsTransparency(
+          sourceImage,
+          targetColor,
+          cleanupTolerance,
+        );
+        if (cleaned.changedPixels > 0) {
+          const revisionId = crypto.randomUUID();
+          const written = await invoke<WrittenContentRevision>("write_content_revision", {
+            projectId: sourceDocument.projectId,
+            revisionId,
+            pngDataUrl: encodePixelImage(cleaned.image),
+          });
+          preparedByContentId.set(sourceContent.id, {
+            id: revisionId,
+            materialId: sourceContent.materialId,
+            sourcePath: written.sourcePath,
+            width: written.width,
+            height: written.height,
+            createdAt: Date.now(),
+          });
+          if (sourceContent.id === sourceCel.contentRevisionId) {
+            currentPreparedImage = cleaned.image;
+          }
+          preparedRevisionCount += 1;
+        }
+        completed += 1;
+        setBatchProgress({ completed, total: uniqueContents.size });
+      }
+
+      const entries = targetCels.flatMap((targetCel) => {
+        const prepared = preparedByContentId.get(targetCel.contentRevisionId);
+        return prepared
+          ? [{ celId: targetCel.id, contentRevision: prepared }]
+          : [];
+      });
+      changedCelCount = entries.length;
+      if (entries.length === 0) {
+        outcome = "no-op";
+        setError("所选画格中没有匹配目标颜色的像素");
+        return false;
+      }
+
+      const latestDocument = useAnimationDocumentStore.getState().document;
+      const latestAnimation = latestDocument?.animations.find(
+        (candidate) => candidate.id === sourceAnimation.id,
+      );
+      const contentChanged = targetCels.some(
+        (sourceTargetCel) =>
+          latestAnimation?.cels.find((candidate) => candidate.id === sourceTargetCel.id)
+            ?.contentRevisionId !== sourceTargetCel.contentRevisionId,
+      );
+      if (latestDocument?.projectId !== sourceDocument.projectId || contentChanged) {
+        throw new Error("批量处理期间项目或画格内容已变化；新文件已保留但未自动切换");
+      }
+
+      useAnimationDocumentStore.getState().execute({
+        type: "set_cel_contents",
+        animationId: sourceAnimation.id,
+        entries,
+      });
+      const appliedAnimation = useAnimationDocumentStore
+        .getState()
+        .document?.animations.find((candidate) => candidate.id === sourceAnimation.id);
+      const expectedContentByCelId = new Map(
+        entries.map((entry) => [entry.celId, entry.contentRevision.id]),
+      );
+      const didApply = entries.every(
+        (entry) =>
+          appliedAnimation?.cels.find((candidate) => candidate.id === entry.celId)
+            ?.contentRevisionId === expectedContentByCelId.get(entry.celId),
+      );
+      if (!didApply) {
+        throw new Error("项目会话已失效，批量内容未切换");
+      }
+      if (currentPreparedImage) updateImage(currentPreparedImage);
+      outcome = "applied";
+      return true;
+    } catch (batchError) {
+      setError(describeError(batchError));
+      return false;
+    } finally {
+      console.info("[FrameForge] batch transparency cleanup ended", {
+        ...logContext,
+        outcome,
+        preparedRevisionCount,
+        changedCelCount,
+      });
+      commitInFlightRef.current = false;
+      setBusy(false);
+      setBatchProgress(null);
+    }
   };
 
   const handleApplyCleanup = async () => {
@@ -324,10 +523,16 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     if (
       !current ||
       !cleanupPreview ||
-      cleanupPreview.changedPixels === 0 ||
+      (cleanupPreview.changedPixels === 0 && !batchCleanupRequested) ||
       busy ||
-      layer?.locked
+      layer?.locked ||
+      (batchCleanupRequested && cleanupSelectionHasLockedLayer)
     ) {
+      return;
+    }
+    if (batchCleanupRequested) {
+      const applied = await applyTransparencyCleanupToSelection();
+      if (applied) handleCloseCleanup();
       return;
     }
     const logContext = {
@@ -659,6 +864,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
               type="button"
               className="text-gray-500 hover:text-white"
               onClick={handleCloseCleanup}
+              disabled={busy}
               aria-label="关闭清理面板"
             >
               ×
@@ -750,6 +956,36 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                   className="w-full accent-orange-500"
                 />
               </label>
+
+              {cleanupSelectionCels.length > 1 && (
+                <div className="mb-3 rounded border border-gray-700 bg-gray-800/70 p-2">
+                  <label className="flex items-start gap-2 text-xs text-gray-300">
+                    <input
+                      type="checkbox"
+                      checked={applyToSelection}
+                      onChange={(event) => setApplyToSelection(event.target.checked)}
+                      disabled={busy}
+                      className="mt-0.5 accent-orange-500"
+                    />
+                    <span>
+                      应用到已选的 {cleanupSelectionCels.length} 个画格
+                      <span className="mt-1 block text-[11px] leading-4 text-gray-500">
+                        当前画格用于预览；应用时使用相同颜色和容差处理全部所选画格。
+                      </span>
+                    </span>
+                  </label>
+                  {cleanupSelectionCels.length > MAX_BATCH_CLEANUP_CELS && (
+                    <div className="mt-2 text-[11px] text-red-400">
+                      单次最多处理 {MAX_BATCH_CLEANUP_CELS} 个画格
+                    </div>
+                  )}
+                  {cleanupSelectionHasLockedLayer && (
+                    <div className="mt-2 text-[11px] text-amber-400">
+                      选择中包含锁定图层，批量应用将被拒绝
+                    </div>
+                  )}
+                </div>
+              )}
             </>
           ) : (
             <label className="mb-3 block text-xs text-gray-400">
@@ -773,6 +1009,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
             type="button"
             className="mb-3 w-full rounded bg-gray-700 px-3 py-2 text-xs text-white hover:bg-gray-600"
             onClick={handleCreateCleanupPreview}
+            disabled={busy}
           >
             {cleanupMode === "transparency" ? "生成透明预览" : "生成压色预览"}
           </button>
@@ -804,6 +1041,11 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                   </div>
                 </div>
               )}
+              {batchProgress && (
+                <div className="rounded bg-gray-800 px-3 py-2 text-xs text-cyan-300">
+                  正在处理内容 {batchProgress.completed}/{batchProgress.total}
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
@@ -828,9 +1070,20 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                 type="button"
                 className="w-full rounded bg-orange-600 px-3 py-2 text-xs font-medium text-white hover:bg-orange-500 disabled:opacity-40"
                 onClick={() => void handleApplyCleanup()}
-                disabled={busy || layer?.locked || cleanupPreview.changedPixels === 0}
+                disabled={
+                  busy ||
+                  layer?.locked ||
+                  (batchCleanupRequested &&
+                    (cleanupSelectionHasLockedLayer ||
+                      cleanupSelectionCels.length > MAX_BATCH_CLEANUP_CELS)) ||
+                  (cleanupPreview.changedPixels === 0 && !batchCleanupRequested)
+                }
               >
-                {layer?.locked ? "图层已锁定" : "应用为新内容版本"}
+                {layer?.locked
+                  ? "图层已锁定"
+                  : batchCleanupRequested
+                    ? `应用到 ${cleanupSelectionCels.length} 个画格`
+                    : "应用为新内容版本"}
               </button>
             </div>
           )}

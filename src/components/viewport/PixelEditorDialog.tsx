@@ -9,6 +9,14 @@ import {
   pastePixelSelection,
   readPixel,
 } from "../../core/pixelImage";
+import {
+  analyzePixelPalette,
+  reducePixelPalette,
+  removeColorAsTransparency,
+  type PaletteReductionResult,
+  type PixelPaletteAnalysis,
+  type TransparencyCleanupResult,
+} from "../../core/pixelCleanup";
 import { useAnimationDocumentStore } from "../../stores/animationDocumentStore";
 import type { Asset } from "../../types/asset";
 import type {
@@ -20,6 +28,8 @@ import type {
 } from "../../types/pixelImage";
 
 type PixelTool = "pencil" | "eraser" | "fill" | "eyedropper" | "selection";
+type CleanupMode = "transparency" | "palette";
+type CleanupPreview = TransparencyCleanupResult | PaletteReductionResult;
 const MAX_EDITABLE_PIXELS = 4 * 1024 * 1024;
 const PIXEL_TOOL_LABELS: Record<PixelTool, string> = {
   pencil: "铅笔",
@@ -117,6 +127,14 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [selection, setSelection] = useState<PixelSelection | null>(null);
   const [hasClipboard, setHasClipboard] = useState(false);
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [cleanupMode, setCleanupMode] = useState<CleanupMode>("transparency");
+  const [cleanupColor, setCleanupColor] = useState("#000000");
+  const [cleanupTolerance, setCleanupTolerance] = useState(0);
+  const [paletteSize, setPaletteSize] = useState(16);
+  const [paletteAnalysis, setPaletteAnalysis] = useState<PixelPaletteAnalysis | null>(null);
+  const [cleanupPreview, setCleanupPreview] = useState<CleanupPreview | null>(null);
+  const [showCleanupPreview, setShowCleanupPreview] = useState(true);
   const documentState = useAnimationDocumentStore((state) => state.document);
   const animation = documentState?.animations[0];
   const cel = animation?.cels.find(
@@ -156,20 +174,27 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     };
   }, [content?.id, content?.sourcePath, updateImage]);
 
+  const displayedImage =
+    cleanupOpen && cleanupPreview && showCleanupPreview ? cleanupPreview.image : image;
+
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !image) return;
-    canvas.width = image.width;
-    canvas.height = image.height;
+    if (!canvas || !displayedImage) return;
+    canvas.width = displayedImage.width;
+    canvas.height = displayedImage.height;
     const context = canvas.getContext("2d");
     if (!context) return;
     context.imageSmoothingEnabled = false;
     context.putImageData(
-      new ImageData(new Uint8ClampedArray(image.data), image.width, image.height),
+      new ImageData(
+        new Uint8ClampedArray(displayedImage.data),
+        displayedImage.width,
+        displayedImage.height,
+      ),
       0,
       0,
     );
-  }, [image]);
+  }, [displayedImage]);
 
   const commit = useCallback(
     async (next: PixelImage) => {
@@ -231,6 +256,98 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     [asset.documentCelId, asset.id],
   );
 
+  const handleOpenCleanup = () => {
+    const current = imageRef.current;
+    if (!current || busy) return;
+    try {
+      const analysis = analyzePixelPalette(current, 16);
+      setPaletteAnalysis(analysis);
+      setCleanupColor(analysis.colors[0] ? colorToHex(analysis.colors[0].color) : "#000000");
+      setCleanupTolerance(0);
+      setPaletteSize(Math.max(2, Math.min(16, analysis.uniqueColorCount ?? 16)));
+      setCleanupMode("transparency");
+      setCleanupPreview(null);
+      setShowCleanupPreview(true);
+      setCleanupOpen(true);
+      setSelection(null);
+      setError(null);
+    } catch (analysisError) {
+      setError(describeError(analysisError));
+    }
+  };
+
+  const handleCleanupColorChange = (value: string) => {
+    setCleanupColor(value);
+    setCleanupPreview(null);
+  };
+
+  const handleCleanupToleranceChange = (value: number) => {
+    setCleanupTolerance(value);
+    setCleanupPreview(null);
+  };
+
+  const handleCleanupModeChange = (value: CleanupMode) => {
+    setCleanupMode(value);
+    setCleanupPreview(null);
+    setShowCleanupPreview(true);
+  };
+
+  const handlePaletteSizeChange = (value: number) => {
+    setPaletteSize(value);
+    setCleanupPreview(null);
+  };
+
+  const handleCreateCleanupPreview = () => {
+    const current = imageRef.current;
+    if (!current) return;
+    try {
+      setCleanupPreview(
+        cleanupMode === "transparency"
+          ? removeColorAsTransparency(current, colorFromHex(cleanupColor), cleanupTolerance)
+          : reducePixelPalette(current, paletteSize),
+      );
+      setShowCleanupPreview(true);
+      setError(null);
+    } catch (previewError) {
+      setError(describeError(previewError));
+    }
+  };
+
+  const handleCloseCleanup = () => {
+    setCleanupOpen(false);
+    setCleanupPreview(null);
+    setPaletteAnalysis(null);
+  };
+
+  const handleApplyCleanup = async () => {
+    const current = imageRef.current;
+    if (
+      !current ||
+      !cleanupPreview ||
+      cleanupPreview.changedPixels === 0 ||
+      busy ||
+      layer?.locked
+    ) {
+      return;
+    }
+    const logContext = {
+      projectId: useAnimationDocumentStore.getState().document?.projectId,
+      celId: cel?.id,
+      changedPixelCount: cleanupPreview.changedPixels,
+      mode: cleanupMode,
+      parameter: cleanupMode === "transparency" ? cleanupTolerance : paletteSize,
+    };
+    console.info("[FrameForge] pixel cleanup started", logContext);
+    updateImage(cleanupPreview.image);
+    const applied = await commit(cleanupPreview.image);
+    if (applied) handleCloseCleanup();
+    else updateImage(current);
+    console.info("[FrameForge] pixel cleanup ended", {
+      ...logContext,
+      outcome: applied ? "applied" : "reverted",
+    });
+  };
+
   const pointFromEvent = (event: React.PointerEvent<HTMLCanvasElement>): PixelPoint => {
     const rect = event.currentTarget.getBoundingClientRect();
     return {
@@ -250,7 +367,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
   };
 
   const handlePointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!imageRef.current || busy || commitInFlightRef.current) return;
+    if (!imageRef.current || busy || cleanupOpen || commitInFlightRef.current) return;
     const point = pointFromEvent(event);
     if (tool === "selection") {
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -327,7 +444,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
   const handlePasteSelection = useCallback(async () => {
     const current = imageRef.current;
     const clipboard = clipboardRef.current;
-    if (!current || !clipboard || busy || commitInFlightRef.current || layer?.locked) return;
+    if (!current || !clipboard || busy || cleanupOpen || commitInFlightRef.current || layer?.locked) return;
     const destination = selection ?? { x: 0, y: 0, width: 1, height: 1 };
     const pasted = pastePixelSelection(current, clipboard, destination);
     updateImage(pasted.image);
@@ -336,12 +453,12 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       updateImage(current);
       setSelection(selection);
     }
-  }, [busy, commit, layer?.locked, selection, updateImage]);
+  }, [busy, cleanupOpen, commit, layer?.locked, selection, updateImage]);
 
   const handleMoveSelection = useCallback(
     async (deltaX: number, deltaY: number) => {
       const current = imageRef.current;
-      if (!current || !selection || busy || commitInFlightRef.current || layer?.locked) return;
+      if (!current || !selection || busy || cleanupOpen || commitInFlightRef.current || layer?.locked) return;
       const moved = movePixelSelection(current, selection, deltaX, deltaY);
       if (moved.image === current) return;
       updateImage(moved.image);
@@ -351,7 +468,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
         setSelection(selection);
       }
     },
-    [busy, commit, layer?.locked, selection, updateImage],
+    [busy, cleanupOpen, commit, layer?.locked, selection, updateImage],
   );
 
   useEffect(() => {
@@ -400,11 +517,21 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
               tool === candidate ? "bg-orange-600 text-white" : "bg-gray-800 text-gray-300"
             }`}
             onClick={() => setTool(candidate)}
-            disabled={busy}
+            disabled={busy || cleanupOpen}
           >
             {PIXEL_TOOL_LABELS[candidate]}
           </button>
         ))}
+        <button
+          type="button"
+          className={`rounded px-3 py-1 text-xs ${
+            cleanupOpen ? "bg-cyan-700 text-white" : "bg-gray-800 text-gray-300"
+          }`}
+          onClick={cleanupOpen ? handleCloseCleanup : handleOpenCleanup}
+          disabled={busy || !image}
+        >
+          像素清理
+        </button>
         {tool === "selection" && (
           <div className="flex items-center gap-1 border-l border-gray-700 pl-2">
             <button type="button" className="rounded bg-gray-800 px-2 py-1 text-xs text-gray-300 disabled:opacity-40" onClick={handleCopySelection} disabled={!selection || busy}>复制</button>
@@ -434,6 +561,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
           onChange={(event) => setColor(event.target.value)}
           className="h-7 w-9 rounded border border-gray-600 bg-transparent"
           aria-label="绘制颜色"
+          disabled={cleanupOpen}
         />
         <label className="ml-2 flex items-center gap-2 text-xs text-gray-400">
           缩放
@@ -485,7 +613,11 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                 width: image.width * zoom,
                 height: image.height * zoom,
                 imageRendering: "pixelated",
-                cursor: tool === "eyedropper" || tool === "selection" ? "crosshair" : "cell",
+                cursor: cleanupOpen
+                  ? "default"
+                  : tool === "eyedropper" || tool === "selection"
+                    ? "crosshair"
+                    : "cell",
                 touchAction: "none",
               }}
               onPointerDown={handlePointerDown}
@@ -519,6 +651,191 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
           <span className="text-sm text-gray-500">{busy ? "正在加载…" : "没有可编辑图片"}</span>
         )}
       </div>
+      {cleanupOpen && paletteAnalysis && (
+        <aside className="absolute right-4 top-14 z-10 w-72 rounded-lg border border-gray-700 bg-gray-900 p-4 shadow-2xl">
+          <div className="mb-3 flex items-center justify-between">
+            <strong className="text-sm text-white">调色板与透明清理</strong>
+            <button
+              type="button"
+              className="text-gray-500 hover:text-white"
+              onClick={handleCloseCleanup}
+              aria-label="关闭清理面板"
+            >
+              ×
+            </button>
+          </div>
+
+          <div className="mb-3 text-[11px] leading-5 text-gray-500">
+            非透明像素 {paletteAnalysis.opaquePixels} · 已透明 {paletteAnalysis.transparentPixels}
+            <br />
+            颜色数 {paletteAnalysis.uniqueColorCount ?? "超过分析上限"}
+          </div>
+
+          <div className="mb-3 grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              className={`rounded px-2 py-1.5 text-xs ${
+                cleanupMode === "transparency"
+                  ? "bg-cyan-700 text-white"
+                  : "bg-gray-800 text-gray-400"
+              }`}
+              onClick={() => handleCleanupModeChange("transparency")}
+            >
+              透明色
+            </button>
+            <button
+              type="button"
+              className={`rounded px-2 py-1.5 text-xs ${
+                cleanupMode === "palette"
+                  ? "bg-cyan-700 text-white"
+                  : "bg-gray-800 text-gray-400"
+              }`}
+              onClick={() => handleCleanupModeChange("palette")}
+            >
+              压缩颜色
+            </button>
+          </div>
+
+          {cleanupMode === "transparency" && (
+            <div className="mb-3">
+              <div className="mb-1 text-xs text-gray-400">常用颜色</div>
+              <div className="grid grid-cols-8 gap-1">
+                {paletteAnalysis.colors.map((entry) => {
+                  const hex = colorToHex(entry.color);
+                  return (
+                    <button
+                      key={`${hex}-${entry.color[3]}`}
+                      type="button"
+                      className={`h-6 rounded border ${
+                        cleanupColor === hex ? "border-white" : "border-gray-600"
+                      }`}
+                      style={{ backgroundColor: hex, opacity: entry.color[3] / 255 }}
+                      onClick={() => handleCleanupColorChange(hex)}
+                      title={`${hex} · ${entry.count} 像素`}
+                      aria-label={`选择颜色 ${hex}，${entry.count} 像素`}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {cleanupMode === "transparency" ? (
+            <>
+              <label className="mb-3 flex items-center gap-2 text-xs text-gray-400">
+                目标颜色
+                <input
+                  type="color"
+                  value={cleanupColor}
+                  onChange={(event) => handleCleanupColorChange(event.target.value)}
+                  className="h-7 w-10 rounded border border-gray-600 bg-transparent"
+                />
+                <span>{cleanupColor.toUpperCase()}</span>
+              </label>
+
+              <label className="mb-3 block text-xs text-gray-400">
+                <span className="mb-1 flex justify-between">
+                  <span>RGB 每通道容差</span>
+                  <span>{cleanupTolerance}</span>
+                </span>
+                <input
+                  type="range"
+                  min="0"
+                  max="64"
+                  step="1"
+                  value={cleanupTolerance}
+                  onChange={(event) =>
+                    handleCleanupToleranceChange(Number(event.target.value))
+                  }
+                  className="w-full accent-orange-500"
+                />
+              </label>
+            </>
+          ) : (
+            <label className="mb-3 block text-xs text-gray-400">
+              <span className="mb-1 flex justify-between">
+                <span>目标颜色数</span>
+                <span>{paletteSize}</span>
+              </span>
+              <input
+                type="range"
+                min="2"
+                max="32"
+                step="1"
+                value={paletteSize}
+                onChange={(event) => handlePaletteSizeChange(Number(event.target.value))}
+                className="w-full accent-orange-500"
+              />
+            </label>
+          )}
+
+          <button
+            type="button"
+            className="mb-3 w-full rounded bg-gray-700 px-3 py-2 text-xs text-white hover:bg-gray-600"
+            onClick={handleCreateCleanupPreview}
+          >
+            {cleanupMode === "transparency" ? "生成透明预览" : "生成压色预览"}
+          </button>
+
+          {cleanupPreview && (
+            <div className="space-y-3">
+              <div className="rounded bg-gray-800 px-3 py-2 text-xs text-gray-300">
+                {cleanupMode === "transparency"
+                  ? `将清除 ${cleanupPreview.changedPixels} 个像素`
+                  : `将调整 ${cleanupPreview.changedPixels} 个像素`}
+              </div>
+              {"palette" in cleanupPreview && cleanupPreview.palette.length > 0 && (
+                <div>
+                  <div className="mb-1 text-xs text-gray-400">
+                    输出调色板 · {cleanupPreview.palette.length} 色
+                  </div>
+                  <div className="grid grid-cols-8 gap-1">
+                    {cleanupPreview.palette.map((entry) => {
+                      const hex = colorToHex(entry);
+                      return (
+                        <span
+                          key={hex}
+                          className="h-6 rounded border border-gray-600"
+                          style={{ backgroundColor: hex }}
+                          title={hex}
+                        />
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  className={`rounded px-2 py-1 text-xs ${
+                    !showCleanupPreview ? "bg-cyan-700 text-white" : "bg-gray-800 text-gray-400"
+                  }`}
+                  onClick={() => setShowCleanupPreview(false)}
+                >
+                  原图
+                </button>
+                <button
+                  type="button"
+                  className={`rounded px-2 py-1 text-xs ${
+                    showCleanupPreview ? "bg-cyan-700 text-white" : "bg-gray-800 text-gray-400"
+                  }`}
+                  onClick={() => setShowCleanupPreview(true)}
+                >
+                  预览
+                </button>
+              </div>
+              <button
+                type="button"
+                className="w-full rounded bg-orange-600 px-3 py-2 text-xs font-medium text-white hover:bg-orange-500 disabled:opacity-40"
+                onClick={() => void handleApplyCleanup()}
+                disabled={busy || layer?.locked || cleanupPreview.changedPixels === 0}
+              >
+                {layer?.locked ? "图层已锁定" : "应用为新内容版本"}
+              </button>
+            </div>
+          )}
+        </aside>
+      )}
     </div>
   );
 }

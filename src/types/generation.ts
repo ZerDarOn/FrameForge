@@ -28,3 +28,22 @@ export interface GeneratedAsset {
   createdAt: number;
   metadata?: Record<string, unknown>;
 }
+
+export type GenerationJobStatus = "running" | "cancelling" | "cancelled" | "failed" | "completed";
+
+export interface GenerationProgress {
+  jobId: string;
+  projectId: string;
+  stage: "generating" | "done" | "cancelled";
+  current: number;
+  total: number;
+}
+
+export interface GenerationJob {
+  id: string;
+  projectId: string;
+  params: TextToPixelParams;
+  status: GenerationJobStatus;
+  progress: GenerationProgress | null;
+  error: string | null;
+}

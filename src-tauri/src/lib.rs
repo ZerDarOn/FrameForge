@@ -25,6 +25,7 @@ pub fn run() {
             let conn = db::init_db(&app_dir).expect("数据库初始化失败");
             app.manage(DbState::new(conn));
             app.manage(ai::AiConfig::new(ai::config::AiConfigState::default()));
+            app.manage(commands::generation::GenerationJobRegistry::default());
 
             Ok(())
         })
@@ -41,8 +42,11 @@ pub fn run() {
             commands::animation_document::read_content_image,
             commands::animation_document::write_content_revision,
             commands::asset::scan_image_folder,
+            commands::asset::inspect_image_file,
             commands::asset::create_track,
             commands::asset::import_files_to_new_track,
+            commands::asset::slice_sprite_sheet_to_new_track,
+            commands::asset::import_gif_to_new_track,
             commands::asset::extract_asset_to_new_track,
             commands::asset::import_frames_to_track,
             commands::asset::get_project_tracks,
@@ -64,6 +68,7 @@ pub fn run() {
             commands::analysis::delete_analysis_report,
             commands::analysis::cloud_consistency_check,
             commands::generation::generate_pixel_art,
+            commands::generation::cancel_generation,
             commands::generation::list_generated_assets,
             commands::generation::delete_generated_asset,
             commands::generation::add_generated_to_timeline,

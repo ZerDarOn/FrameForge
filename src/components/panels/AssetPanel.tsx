@@ -109,6 +109,14 @@ export function AssetPanel() {  const tab = useUIStore((s) => s.sidebarTab);
             onClick={() => window.dispatchEvent(new CustomEvent("frameforge:import-files"))}>
             导入文件
           </button>
+          <button className="w-full py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+            onClick={() => window.dispatchEvent(new CustomEvent("frameforge:import-sprite-sheet"))}>
+            导入精灵图
+          </button>
+          <button className="w-full py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+            onClick={() => window.dispatchEvent(new CustomEvent("frameforge:import-gif"))}>
+            导入 GIF
+          </button>
         </div>
       )}
     </div>

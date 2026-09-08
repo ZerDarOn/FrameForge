@@ -1,8 +1,16 @@
 use crate::db::DbState;
+use image::{AnimationDecoder, ImageDecoder};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use tauri::State;
+use std::{fs::File, io::BufReader, path::Path};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+const MAX_SPRITE_SHEET_FRAMES: usize = 10_000;
+const MAX_SPRITE_SHEET_PIXELS: u64 = 67_108_864;
+const MAX_GIF_FRAMES: usize = 10_000;
+const MAX_GIF_CANVAS_PIXELS: u64 = 16_777_216;
+const MAX_GIF_DECODED_PIXELS: u64 = 268_435_456;
+const MAX_GIF_OUTPUT_BYTES: u64 = 1_073_741_824;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +50,134 @@ pub struct TrackInfo {
     pub opacity: f64,
     pub track_order: i64,
     pub assets: Vec<AssetInfo>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageFileInfo {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpriteSheetImportProgress {
+    operation_id: String,
+    project_id: String,
+    stage: String,
+    completed: usize,
+    total: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GifImportProgress {
+    operation_id: String,
+    project_id: String,
+    stage: String,
+    completed: usize,
+    total: Option<usize>,
+}
+
+#[derive(Debug)]
+struct PreparedGifFrame {
+    path: String,
+    width: i64,
+    height: i64,
+    start_frame: i64,
+    duration_frames: i64,
+    source_timestamp: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpriteSheetSliceRect {
+    index: usize,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+fn gif_delay_to_ticks(numerator_ms: u32, denominator: u32, fps: i64) -> i64 {
+    if denominator == 0 || fps <= 0 {
+        return 1;
+    }
+    let scaled_numerator = u64::from(numerator_ms) * fps as u64;
+    let scaled_denominator = u64::from(denominator) * 1_000;
+    ((scaled_numerator + scaled_denominator / 2) / scaled_denominator).max(1) as i64
+}
+
+fn plan_sprite_sheet_slices(
+    sheet_width: u32,
+    sheet_height: u32,
+    cell_width: u32,
+    cell_height: u32,
+    offset_x: u32,
+    offset_y: u32,
+    spacing_x: u32,
+    spacing_y: u32,
+    frame_count: Option<u32>,
+) -> Result<Vec<SpriteSheetSliceRect>, String> {
+    if cell_width == 0 || cell_height == 0 {
+        return Err("切片宽高必须为正整数".to_string());
+    }
+    let available_width = sheet_width.saturating_sub(offset_x);
+    let available_height = sheet_height.saturating_sub(offset_y);
+    let columns = (u64::from(available_width) + u64::from(spacing_x))
+        / (u64::from(cell_width) + u64::from(spacing_x));
+    let rows = (u64::from(available_height) + u64::from(spacing_y))
+        / (u64::from(cell_height) + u64::from(spacing_y));
+    let available_cells = columns.saturating_mul(rows);
+    if available_cells == 0 {
+        return Err("精灵图网格中没有完整画格".to_string());
+    }
+    let requested_count =
+        u64::from(frame_count.unwrap_or(available_cells.min(u64::from(u32::MAX)) as u32));
+    if requested_count == 0 || requested_count > available_cells {
+        return Err(format!("请求帧数必须在 1 到 {} 之间", available_cells));
+    }
+    if requested_count > MAX_SPRITE_SHEET_FRAMES as u64 {
+        return Err(format!("单次切片不能超过 {} 帧", MAX_SPRITE_SHEET_FRAMES));
+    }
+
+    let mut slices = Vec::with_capacity(requested_count as usize);
+    for index in 0..requested_count {
+        let column = index % columns;
+        let row = index / columns;
+        let x = u64::from(offset_x) + column * (u64::from(cell_width) + u64::from(spacing_x));
+        let y = u64::from(offset_y) + row * (u64::from(cell_height) + u64::from(spacing_y));
+        slices.push(SpriteSheetSliceRect {
+            index: index as usize,
+            x: u32::try_from(x).map_err(|_| "精灵图横向切片坐标超出范围".to_string())?,
+            y: u32::try_from(y).map_err(|_| "精灵图纵向切片坐标超出范围".to_string())?,
+            width: cell_width,
+            height: cell_height,
+        });
+    }
+    Ok(slices)
+}
+
+fn inspect_sprite_sheet(path: &str) -> Result<ImageFileInfo, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| format!("读取精灵图失败: {}", e))?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
+        return Err("精灵图必须是小于 64 MiB 的文件".to_string());
+    }
+    let (width, height) =
+        image::image_dimensions(path).map_err(|e| format!("读取精灵图尺寸失败: {}", e))?;
+    if width == 0
+        || height == 0
+        || width > 16_384
+        || height > 16_384
+        || u64::from(width) * u64::from(height) > MAX_SPRITE_SHEET_PIXELS
+    {
+        return Err("精灵图尺寸或像素总量超出安全范围".to_string());
+    }
+    Ok(ImageFileInfo { width, height })
+}
+
+#[tauri::command]
+pub fn inspect_image_file(file_path: String) -> Result<ImageFileInfo, String> {
+    inspect_sprite_sheet(&file_path)
 }
 
 /// 扫描文件夹中的图片序列帧，返回文件路径列表
@@ -132,7 +268,7 @@ pub fn import_files_to_new_track(
         if operation_id.is_empty() || operation_id.len() > 128 {
             return Err("导入 operationId 无效".to_string());
         }
-        if name.trim().is_empty() || name.len() > 128 {
+        if name.trim().is_empty() || name.chars().count() > 128 {
             return Err("轨道名称必须为 1..=128 个字符".to_string());
         }
         if track_type != "image_sequence" {
@@ -273,6 +409,558 @@ pub fn import_files_to_new_track(
             project_id,
             error
         ),
+    }
+    result
+}
+
+fn cleanup_sprite_sheet_output(file_paths: &[String], output_dir: &Path) {
+    for file_path in file_paths {
+        if let Err(error) = std::fs::remove_file(file_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("sprite sheet frame cleanup failed");
+            }
+        }
+    }
+    if let Err(error) = std::fs::remove_dir(output_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            log::warn!("sprite sheet output directory cleanup failed");
+        }
+    }
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn slice_sprite_sheet_to_new_track(
+    app: AppHandle,
+    operation_id: String,
+    project_id: String,
+    name: String,
+    source_path: String,
+    cell_width: u32,
+    cell_height: u32,
+    offset_x: u32,
+    offset_y: u32,
+    spacing_x: u32,
+    spacing_y: u32,
+    frame_count: Option<u32>,
+    fps: i64,
+) -> Result<TrackInfo, String> {
+    let state_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = state_app.state::<DbState>();
+        slice_sprite_sheet_to_new_track_blocking(
+            db,
+            &state_app,
+            operation_id,
+            project_id,
+            name,
+            source_path,
+            cell_width,
+            cell_height,
+            offset_x,
+            offset_y,
+            spacing_x,
+            spacing_y,
+            frame_count,
+            fps,
+        )
+    })
+    .await
+    .map_err(|error| format!("精灵图导入工作线程失败: {}", error))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn slice_sprite_sheet_to_new_track_blocking(
+    db: State<'_, DbState>,
+    app: &AppHandle,
+    operation_id: String,
+    project_id: String,
+    name: String,
+    source_path: String,
+    cell_width: u32,
+    cell_height: u32,
+    offset_x: u32,
+    offset_y: u32,
+    spacing_x: u32,
+    spacing_y: u32,
+    frame_count: Option<u32>,
+    fps: i64,
+) -> Result<TrackInfo, String> {
+    log::info!(
+        "sprite sheet import started: operation_id={}, project_id={}",
+        operation_id,
+        project_id
+    );
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    {
+        return Err("精灵图导入 operationId 无效".to_string());
+    }
+    if name.trim().is_empty() || name.chars().count() > 128 {
+        return Err("轨道名称必须为 1..=128 个字符".to_string());
+    }
+    if !(1..=240).contains(&fps) {
+        return Err("项目帧率必须在 1..=240 范围内".to_string());
+    }
+    {
+        let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
+        let project_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("检查项目失败: {}", e))?;
+        if !project_exists {
+            return Err("精灵图导入目标项目不存在".to_string());
+        }
+    }
+
+    let image_info = inspect_sprite_sheet(&source_path)?;
+    let slices = plan_sprite_sheet_slices(
+        image_info.width,
+        image_info.height,
+        cell_width,
+        cell_height,
+        offset_x,
+        offset_y,
+        spacing_x,
+        spacing_y,
+        frame_count,
+    )?;
+    let source_image = image::open(&source_path).map_err(|e| format!("解码精灵图失败: {}", e))?;
+    let output_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("获取应用目录失败: {}", e))?
+        .join("processed")
+        .join("sprite_sheets");
+    std::fs::create_dir_all(&output_root)
+        .map_err(|e| format!("创建精灵图输出根目录失败: {}", e))?;
+    let output_dir = output_root.join(&operation_id);
+    std::fs::create_dir(&output_dir).map_err(|e| format!("创建精灵图输出目录失败: {}", e))?;
+
+    let mut file_paths = Vec::with_capacity(slices.len());
+    let total_slices = slices.len();
+    let progress_interval = (total_slices / 100).max(1);
+    let _ = app.emit(
+        "sprite-sheet-progress",
+        SpriteSheetImportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "slicing".to_string(),
+            completed: 0,
+            total: total_slices,
+        },
+    );
+    let prepare_result = (|| -> Result<(), String> {
+        for slice in slices {
+            let output_path = output_dir.join(format!("frame_{:05}.png", slice.index));
+            let output_path_string = output_path.to_string_lossy().to_string();
+            file_paths.push(output_path_string);
+            source_image
+                .crop_imm(slice.x, slice.y, slice.width, slice.height)
+                .save(&output_path)
+                .map_err(|e| format!("写入切片 PNG 失败: {}", e))?;
+            let dimensions = image::image_dimensions(&output_path)
+                .map_err(|e| format!("验证切片 PNG 失败: {}", e))?;
+            if dimensions != (slice.width, slice.height) {
+                return Err("切片 PNG 尺寸验证失败".to_string());
+            }
+            let completed = file_paths.len();
+            if completed == total_slices || completed % progress_interval == 0 {
+                let _ = app.emit(
+                    "sprite-sheet-progress",
+                    SpriteSheetImportProgress {
+                        operation_id: operation_id.clone(),
+                        project_id: project_id.clone(),
+                        stage: "slicing".to_string(),
+                        completed,
+                        total: total_slices,
+                    },
+                );
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = prepare_result {
+        cleanup_sprite_sheet_output(&file_paths, &output_dir);
+        log::warn!(
+            "sprite sheet import failed: operation_id={}, project_id={}, stage=prepare",
+            operation_id,
+            project_id
+        );
+        return Err(error);
+    }
+
+    let _ = app.emit(
+        "sprite-sheet-progress",
+        SpriteSheetImportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "committing".to_string(),
+            completed: total_slices,
+            total: total_slices,
+        },
+    );
+
+    let result = import_files_to_new_track(
+        db,
+        operation_id.clone(),
+        project_id.clone(),
+        name,
+        "image_sequence".to_string(),
+        file_paths.clone(),
+        0,
+        fps,
+        0,
+    );
+    match &result {
+        Ok(track) => log::info!(
+            "sprite sheet import committed: operation_id={}, project_id={}, track_id={}, frame_count={}",
+            operation_id,
+            project_id,
+            track.id,
+            track.assets.len()
+        ),
+        Err(_) => {
+            cleanup_sprite_sheet_output(&file_paths, &output_dir);
+            log::warn!(
+                "sprite sheet import failed: operation_id={}, project_id={}, stage=commit",
+                operation_id,
+                project_id
+            );
+        }
+    }
+    result
+}
+
+fn cleanup_gif_output(file_paths: &[String], output_dir: &Path) {
+    for file_path in file_paths {
+        if let Err(error) = std::fs::remove_file(file_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("gif frame cleanup failed");
+            }
+        }
+    }
+    if let Err(error) = std::fs::remove_dir(output_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            log::warn!("gif output directory cleanup failed");
+        }
+    }
+}
+
+fn commit_gif_frames_to_new_track(
+    db: State<'_, DbState>,
+    project_id: &str,
+    name: &str,
+    frames: &[PreparedGifFrame],
+) -> Result<TrackInfo, String> {
+    let track_id = uuid::Uuid::new_v4().to_string();
+    let assets: Vec<AssetInfo> = frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| AssetInfo {
+            id: uuid::Uuid::new_v4().to_string(),
+            track_id: track_id.clone(),
+            name: format!("GIF 帧 {}", index + 1),
+            source_type: "image".to_string(),
+            source_path: frame.path.clone(),
+            thumbnail_path: frame.path.clone(),
+            start_frame: frame.start_frame,
+            duration_frames: frame.duration_frames,
+            width: frame.width,
+            height: frame.height,
+            transform_x: 0.0,
+            transform_y: 0.0,
+            transform_scale_x: 1.0,
+            transform_scale_y: 1.0,
+            transform_rotation: 0.0,
+            alignment_dx: 0.0,
+            alignment_dy: 0.0,
+            matched_fps: true,
+            source_timestamp: frame.source_timestamp,
+        })
+        .collect();
+
+    let mut conn = db
+        .lock()
+        .map_err(|error| format!("数据库锁失败: {}", error))?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("开始 GIF 导入事务失败: {}", error))?;
+    let project_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("检查 GIF 导入项目失败: {}", error))?;
+    if !project_exists {
+        return Err("GIF 导入目标项目不存在".to_string());
+    }
+    let track_order: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(track_order), -1) + 1 FROM tracks WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("读取 GIF 轨道顺序失败: {}", error))?;
+    tx.execute(
+        "INSERT INTO tracks (id, project_id, name, type, visible, locked, opacity, track_order)
+         VALUES (?1, ?2, ?3, 'image_sequence', 1, 0, 1.0, ?4)",
+        params![&track_id, project_id, name, track_order],
+    )
+    .map_err(|error| format!("创建 GIF 轨道失败: {}", error))?;
+    for asset in &assets {
+        tx.execute(
+            "INSERT INTO assets (id, track_id, name, source_type, source_path, thumbnail_path, start_frame, duration_frames, width, height, matched_fps, source_timestamp)
+             VALUES (?1, ?2, ?3, 'image', ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)",
+            params![
+                &asset.id,
+                &asset.track_id,
+                &asset.name,
+                &asset.source_path,
+                &asset.thumbnail_path,
+                asset.start_frame,
+                asset.duration_frames,
+                asset.width,
+                asset.height,
+                asset.source_timestamp,
+            ],
+        )
+        .map_err(|error| format!("写入 GIF 画格失败: {}", error))?;
+    }
+    tx.commit()
+        .map_err(|error| format!("提交 GIF 导入事务失败: {}", error))?;
+
+    Ok(TrackInfo {
+        id: track_id,
+        project_id: project_id.to_string(),
+        name: name.to_string(),
+        track_type: "image_sequence".to_string(),
+        visible: true,
+        locked: false,
+        opacity: 1.0,
+        track_order,
+        assets,
+    })
+}
+
+#[tauri::command]
+pub async fn import_gif_to_new_track(
+    app: AppHandle,
+    operation_id: String,
+    project_id: String,
+    name: String,
+    source_path: String,
+    fps: i64,
+) -> Result<TrackInfo, String> {
+    let state_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = state_app.state::<DbState>();
+        import_gif_to_new_track_blocking(
+            db,
+            &state_app,
+            operation_id,
+            project_id,
+            name,
+            source_path,
+            fps,
+        )
+    })
+    .await
+    .map_err(|error| format!("GIF 导入工作线程失败: {}", error))?
+}
+
+fn import_gif_to_new_track_blocking(
+    db: State<'_, DbState>,
+    app: &AppHandle,
+    operation_id: String,
+    project_id: String,
+    name: String,
+    source_path: String,
+    fps: i64,
+) -> Result<TrackInfo, String> {
+    log::info!(
+        "gif import started: operation_id={}, project_id={}",
+        operation_id,
+        project_id
+    );
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    {
+        return Err("GIF 导入 operationId 无效".to_string());
+    }
+    if name.trim().is_empty() || name.chars().count() > 128 {
+        return Err("轨道名称必须为 1..=128 个字符".to_string());
+    }
+    if !(1..=240).contains(&fps) {
+        return Err("项目帧率必须在 1..=240 范围内".to_string());
+    }
+    {
+        let conn = db
+            .lock()
+            .map_err(|error| format!("数据库锁失败: {}", error))?;
+        let project_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                params![&project_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("检查 GIF 导入项目失败: {}", error))?;
+        if !project_exists {
+            return Err("GIF 导入目标项目不存在".to_string());
+        }
+    }
+
+    let source_metadata =
+        std::fs::metadata(&source_path).map_err(|error| format!("读取 GIF 失败: {}", error))?;
+    if !source_metadata.is_file() || source_metadata.len() > 64 * 1024 * 1024 {
+        return Err("GIF 必须是小于 64 MiB 的文件".to_string());
+    }
+    let source_file =
+        File::open(&source_path).map_err(|error| format!("打开 GIF 失败: {}", error))?;
+    let decoder = image::codecs::gif::GifDecoder::new(BufReader::new(source_file))
+        .map_err(|error| format!("解码 GIF 头失败: {}", error))?;
+    let (width, height) = decoder.dimensions();
+    let canvas_pixels = u64::from(width) * u64::from(height);
+    if width == 0 || height == 0 || canvas_pixels > MAX_GIF_CANVAS_PIXELS {
+        return Err("GIF 画布尺寸或像素总量超出安全范围".to_string());
+    }
+
+    let output_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("获取应用目录失败: {}", error))?
+        .join("processed")
+        .join("gifs");
+    std::fs::create_dir_all(&output_root)
+        .map_err(|error| format!("创建 GIF 输出根目录失败: {}", error))?;
+    let output_dir = output_root.join(&operation_id);
+    std::fs::create_dir(&output_dir)
+        .map_err(|error| format!("创建 GIF 输出目录失败: {}", error))?;
+
+    let mut file_paths = Vec::new();
+    let result = (|| -> Result<TrackInfo, String> {
+        let _ = app.emit(
+            "gif-import-progress",
+            GifImportProgress {
+                operation_id: operation_id.clone(),
+                project_id: project_id.clone(),
+                stage: "decoding".to_string(),
+                completed: 0,
+                total: None,
+            },
+        );
+        let mut prepared_frames = Vec::new();
+        let mut decoded_pixels = 0_u64;
+        let mut output_bytes = 0_u64;
+        let mut timeline_tick = 0_i64;
+        let mut source_timestamp_ms = 0_f64;
+
+        for (index, frame_result) in decoder.into_frames().enumerate() {
+            if index >= MAX_GIF_FRAMES {
+                return Err(format!("GIF 不能超过 {} 帧", MAX_GIF_FRAMES));
+            }
+            let frame = frame_result.map_err(|error| format!("解码 GIF 帧失败: {}", error))?;
+            let (delay_numerator, delay_denominator) = frame.delay().numer_denom_ms();
+            let duration_frames = gif_delay_to_ticks(delay_numerator, delay_denominator, fps);
+            let buffer = frame.into_buffer();
+            if buffer.width() != width || buffer.height() != height {
+                return Err("GIF 解码帧与画布尺寸不一致".to_string());
+            }
+            decoded_pixels = decoded_pixels
+                .checked_add(canvas_pixels)
+                .ok_or_else(|| "GIF 解码像素计数溢出".to_string())?;
+            if decoded_pixels > MAX_GIF_DECODED_PIXELS {
+                return Err("GIF 解码后的总像素量超出安全范围".to_string());
+            }
+
+            let output_path = output_dir.join(format!("frame_{:05}.png", index));
+            let output_path_string = output_path.to_string_lossy().to_string();
+            file_paths.push(output_path_string.clone());
+            buffer
+                .save(&output_path)
+                .map_err(|error| format!("写入 GIF 帧 PNG 失败: {}", error))?;
+            output_bytes = output_bytes
+                .checked_add(
+                    std::fs::metadata(&output_path)
+                        .map_err(|error| format!("检查 GIF 帧文件失败: {}", error))?
+                        .len(),
+                )
+                .ok_or_else(|| "GIF 输出体积计数溢出".to_string())?;
+            if output_bytes > MAX_GIF_OUTPUT_BYTES {
+                return Err("GIF 解码后的文件总量超过 1 GiB".to_string());
+            }
+
+            prepared_frames.push(PreparedGifFrame {
+                path: output_path_string,
+                width: i64::from(width),
+                height: i64::from(height),
+                start_frame: timeline_tick,
+                duration_frames,
+                source_timestamp: source_timestamp_ms.round() as i64,
+            });
+            timeline_tick = timeline_tick
+                .checked_add(duration_frames)
+                .ok_or_else(|| "GIF 时间线长度溢出".to_string())?;
+            source_timestamp_ms += f64::from(delay_numerator) / f64::from(delay_denominator.max(1));
+
+            let completed = prepared_frames.len();
+            if completed == 1 || completed % 10 == 0 {
+                let _ = app.emit(
+                    "gif-import-progress",
+                    GifImportProgress {
+                        operation_id: operation_id.clone(),
+                        project_id: project_id.clone(),
+                        stage: "decoding".to_string(),
+                        completed,
+                        total: None,
+                    },
+                );
+            }
+        }
+        if prepared_frames.is_empty() {
+            return Err("GIF 中没有可导入的动画帧".to_string());
+        }
+
+        let _ = app.emit(
+            "gif-import-progress",
+            GifImportProgress {
+                operation_id: operation_id.clone(),
+                project_id: project_id.clone(),
+                stage: "committing".to_string(),
+                completed: prepared_frames.len(),
+                total: Some(prepared_frames.len()),
+            },
+        );
+        commit_gif_frames_to_new_track(db, &project_id, name.trim(), &prepared_frames)
+    })();
+
+    match &result {
+        Ok(track) => log::info!(
+            "gif import committed: operation_id={}, project_id={}, track_id={}, frame_count={}, timeline_ticks={}",
+            operation_id,
+            project_id,
+            track.id,
+            track.assets.len(),
+            track.assets.iter().map(|asset| asset.duration_frames).sum::<i64>()
+        ),
+        Err(_) => {
+            cleanup_gif_output(&file_paths, &output_dir);
+            log::warn!(
+                "gif import failed: operation_id={}, project_id={}",
+                operation_id,
+                project_id
+            );
+        }
     }
     result
 }
@@ -934,4 +1622,74 @@ pub fn export_gif(
     }
 
     Ok(exported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gif_delay_to_ticks, plan_sprite_sheet_slices, SpriteSheetSliceRect};
+
+    #[test]
+    fn quantizes_gif_delay_to_project_ticks_with_a_one_tick_minimum() {
+        assert_eq!(gif_delay_to_ticks(100, 1, 24), 2);
+        assert_eq!(gif_delay_to_ticks(125, 1, 24), 3);
+        assert_eq!(gif_delay_to_ticks(125, 2, 24), 2);
+        assert_eq!(gif_delay_to_ticks(0, 1, 24), 1);
+        assert_eq!(gif_delay_to_ticks(100, 0, 24), 1);
+    }
+
+    #[test]
+    fn plans_sprite_sheet_cells_in_row_major_order() {
+        let slices = plan_sprite_sheet_slices(35, 18, 16, 8, 1, 1, 1, 1, None).unwrap();
+
+        assert_eq!(
+            slices,
+            vec![
+                SpriteSheetSliceRect {
+                    index: 0,
+                    x: 1,
+                    y: 1,
+                    width: 16,
+                    height: 8,
+                },
+                SpriteSheetSliceRect {
+                    index: 1,
+                    x: 18,
+                    y: 1,
+                    width: 16,
+                    height: 8,
+                },
+                SpriteSheetSliceRect {
+                    index: 2,
+                    x: 1,
+                    y: 10,
+                    width: 16,
+                    height: 8,
+                },
+                SpriteSheetSliceRect {
+                    index: 3,
+                    x: 18,
+                    y: 10,
+                    width: 16,
+                    height: 8,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_excessive_sprite_sheet_plans() {
+        assert!(plan_sprite_sheet_slices(64, 64, 0, 16, 0, 0, 0, 0, None).is_err());
+        assert!(plan_sprite_sheet_slices(64, 64, 16, 16, 0, 0, 0, 0, Some(17)).is_err());
+        assert!(plan_sprite_sheet_slices(200, 100, 1, 1, 0, 0, 0, 0, Some(10_001)).is_err());
+    }
+
+    #[test]
+    fn large_spacing_does_not_overflow_coordinates() {
+        let slices =
+            plan_sprite_sheet_slices(16, 16, 16, 16, 0, 0, u32::MAX, u32::MAX, None).unwrap();
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].x, 0);
+        assert_eq!(slices[0].y, 0);
+    }
 }

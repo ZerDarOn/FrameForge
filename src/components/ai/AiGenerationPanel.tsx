@@ -6,6 +6,7 @@ import { useProjectStore } from "../../stores/projectStore";
 import { useTimelineStore } from "../../stores/timelineStore";
 import { useAiConfigStore } from "../../stores/aiConfigStore";
 import { listen } from "@tauri-apps/api/event";
+import type { GenerationProgress } from "../../types/generation";
 
 const STYLES = [
   { value: "8bit", label: "8-bit" },
@@ -24,10 +25,12 @@ const SIZES = [
 export function AiGenerationPanel() {
   const project = useProjectStore((s) => s.project);
   const assets = useGenerationStore((s) => s.assets);
-  const isGenerating = useGenerationStore((s) => s.isGenerating);
-  const progress = useGenerationStore((s) => s.progress);
+  const activeJob = useGenerationStore((s) => s.activeJob);
   const error = useGenerationStore((s) => s.error);
   const generate = useGenerationStore((s) => s.generate);
+  const cancelActiveJob = useGenerationStore((s) => s.cancelActiveJob);
+  const retryActiveJob = useGenerationStore((s) => s.retryActiveJob);
+  const handleProgress = useGenerationStore((s) => s.handleProgress);
   const loadAssets = useGenerationStore((s) => s.loadAssets);
   const deleteAsset = useGenerationStore((s) => s.deleteAsset);
   const addToTimeline = useGenerationStore((s) => s.addToTimeline);
@@ -41,6 +44,8 @@ export function AiGenerationPanel() {
 
   const aiConfig = useAiConfigStore((s) => s.config);
   const loadConfig = useAiConfigStore((s) => s.loadConfig);
+  const isGenerating = activeJob?.status === "running" || activeJob?.status === "cancelling";
+  const progress = activeJob?.progress ?? null;
 
   // 获取可用的生成 Provider
   const generationProviders = aiConfig?.providers.filter(
@@ -54,14 +59,12 @@ export function AiGenerationPanel() {
 
   // 监听生成进度
   useEffect(() => {
-    const unlisten = listen<{ stage: string; current: number; total: number }>(
+    const unlisten = listen<GenerationProgress>(
       "generation-progress",
-      (event) => {
-        useGenerationStore.setState({ progress: event.payload });
-      }
+      (event) => handleProgress(event.payload),
     );
     return () => { unlisten.then((fn) => fn()); };
-  }, []);
+  }, [handleProgress]);
 
   const handleGenerate = () => {
     if (!project || !prompt.trim()) return;
@@ -206,6 +209,7 @@ export function AiGenerationPanel() {
           <div>
             <div className="text-[10px] text-gray-500 mb-1">
               {progress.stage === "generating" && `生成中 ${progress.current}/${progress.total}...`}
+              {progress.stage === "cancelled" && "生成已取消"}
               {progress.stage === "done" && "生成完成"}
             </div>
             <div className="w-full bg-gray-800 rounded-full h-1">
@@ -223,8 +227,27 @@ export function AiGenerationPanel() {
           onClick={handleGenerate}
           disabled={isGenerating || !prompt.trim()}
         >
-          {isGenerating ? "生成中..." : "生成像素画"}
+          {activeJob?.status === "cancelling" ? "取消中..." : isGenerating ? "生成中..." : "生成像素画"}
         </button>
+        {isGenerating && (
+          <button
+            type="button"
+            className="w-full py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-300 disabled:opacity-50"
+            onClick={() => void cancelActiveJob()}
+            disabled={activeJob?.status === "cancelling"}
+          >
+            {activeJob?.status === "cancelling" ? "正在等待安全取消" : "取消生成"}
+          </button>
+        )}
+        {(activeJob?.status === "failed" || activeJob?.status === "cancelled") && (
+          <button
+            type="button"
+            className="w-full py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-orange-300"
+            onClick={() => void retryActiveJob()}
+          >
+            使用原参数重试
+          </button>
+        )}
       </div>
 
       {/* 生成历史 */}
@@ -259,7 +282,7 @@ export function AiGenerationPanel() {
                   </button>
                   <button
                     className="px-2 py-1 bg-gray-700 hover:bg-red-900/50 rounded text-[10px] text-gray-400"
-                    onClick={() => deleteAsset(asset.id)}
+                    onClick={() => project && deleteAsset(asset.id, project.id)}
                   >
                     删除
                   </button>

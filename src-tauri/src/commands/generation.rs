@@ -1,10 +1,166 @@
-use crate::ai::AiConfig;
 use crate::ai::config::ProviderConfig;
+use crate::ai::AiConfig;
 use crate::db::DbState;
 use base64::Engine;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+const MAX_PROMPT_CHARS: usize = 2_000;
+const MAX_GENERATION_DIMENSION: u32 = 1_024;
+const MAX_VARIANTS: u32 = 4;
+const GENERATION_CANCELLED: &str = "GENERATION_CANCELLED";
+
+#[derive(Debug)]
+struct GenerationJobRecord {
+    project_id: String,
+    cancelled: bool,
+}
+
+#[derive(Default)]
+pub struct GenerationJobRegistry {
+    jobs: Mutex<HashMap<String, GenerationJobRecord>>,
+}
+
+impl GenerationJobRegistry {
+    fn register(&self, job_id: &str, project_id: &str) -> Result<(), String> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "生成任务状态锁失败".to_string())?;
+        if jobs.contains_key(job_id) {
+            return Err("生成任务 ID 已存在".to_string());
+        }
+        jobs.insert(
+            job_id.to_string(),
+            GenerationJobRecord {
+                project_id: project_id.to_string(),
+                cancelled: false,
+            },
+        );
+        Ok(())
+    }
+
+    fn request_cancel(&self, job_id: &str, project_id: &str) -> Result<bool, String> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "生成任务状态锁失败".to_string())?;
+        let Some(job) = jobs.get_mut(job_id) else {
+            return Ok(false);
+        };
+        if job.project_id != project_id {
+            return Ok(false);
+        }
+        job.cancelled = true;
+        Ok(true)
+    }
+
+    fn ensure_active(&self, job_id: &str, project_id: &str) -> Result<(), String> {
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "生成任务状态锁失败".to_string())?;
+        match jobs.get(job_id) {
+            Some(job) if job.project_id == project_id && !job.cancelled => Ok(()),
+            _ => Err(GENERATION_CANCELLED.to_string()),
+        }
+    }
+
+    fn finish(&self, job_id: &str, project_id: &str) -> bool {
+        let Ok(mut jobs) = self.jobs.lock() else {
+            return false;
+        };
+        matches!(
+            jobs.remove(job_id),
+            Some(job) if job.project_id == project_id && !job.cancelled
+        )
+    }
+}
+
+fn validate_generation_request(
+    db: &DbState,
+    project_id: &str,
+    params: &TextToPixelParams,
+) -> Result<(), String> {
+    let prompt_length = params.prompt.trim().chars().count();
+    if prompt_length == 0 || prompt_length > MAX_PROMPT_CHARS {
+        return Err(format!(
+            "提示词长度必须在 1 到 {} 个字符之间",
+            MAX_PROMPT_CHARS
+        ));
+    }
+    if params.width == 0
+        || params.height == 0
+        || params.width > MAX_GENERATION_DIMENSION
+        || params.height > MAX_GENERATION_DIMENSION
+    {
+        return Err(format!(
+            "生成尺寸必须在 1 到 {} 像素之间",
+            MAX_GENERATION_DIMENSION
+        ));
+    }
+    if params.num_variants == 0 || params.num_variants > MAX_VARIANTS {
+        return Err(format!("候选数量必须在 1 到 {} 之间", MAX_VARIANTS));
+    }
+    let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
+    let project_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("验证项目失败: {}", e))?;
+    if project_count != 1 {
+        return Err("项目不存在".to_string());
+    }
+    Ok(())
+}
+
+fn cleanup_generated_assets(db: &DbState, assets: &[GeneratedAsset]) {
+    if let Ok(conn) = db.lock() {
+        for asset in assets {
+            let deleted = match conn.execute(
+                "DELETE FROM generated_assets WHERE id = ?1 AND project_id = ?2",
+                params![asset.id, asset.project_id],
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    log::warn!(
+                        "generated asset rollback database cleanup failed: asset_id={}, project_id={}, error={}",
+                        asset.id,
+                        asset.project_id,
+                        error
+                    );
+                    false
+                }
+            };
+            if !deleted {
+                continue;
+            }
+            if let Err(error) = std::fs::remove_file(&asset.file_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(
+                        "generated asset rollback file cleanup failed: asset_id={}, project_id={}",
+                        asset.id,
+                        asset.project_id
+                    );
+                }
+            }
+            if let Err(error) = std::fs::remove_file(&asset.thumbnail_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(
+                        "generated asset rollback thumbnail cleanup failed: asset_id={}, project_id={}",
+                        asset.id,
+                        asset.project_id
+                    );
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -65,11 +221,15 @@ fn build_pixel_prompt(params: &TextToPixelParams) -> String {
         other => other,
     };
 
-    let palette_desc = params.palette.as_ref()
+    let palette_desc = params
+        .palette
+        .as_ref()
         .map(|p| format!("limited to these exact colors: {}", p.join(", ")))
         .unwrap_or_default();
 
-    let neg = params.negative_prompt.as_ref()
+    let neg = params
+        .negative_prompt
+        .as_ref()
         .map(|n| format!("NOT {}", n))
         .unwrap_or_default();
 
@@ -85,34 +245,54 @@ fn build_pixel_prompt(params: &TextToPixelParams) -> String {
 pub async fn generate_pixel_art(
     db: State<'_, DbState>,
     config: State<'_, AiConfig>,
+    jobs: State<'_, GenerationJobRegistry>,
     app: AppHandle,
+    job_id: String,
     project_id: String,
     params: TextToPixelParams,
 ) -> Result<Vec<GeneratedAsset>, String> {
-    let (provider_id, api_key, provider_config) = {
+    validate_generation_request(&db, &project_id, &params)?;
+    jobs.register(&job_id, &project_id)?;
+    log::info!(
+        "generation job started: job_id={}, project_id={}, variants={}",
+        job_id,
+        project_id,
+        params.num_variants
+    );
+    let mut results = Vec::new();
+    let mut outcome = async {
+      let (provider_id, api_key, provider_config) = {
         let cfg = config.lock().map_err(|e| format!("配置锁失败: {}", e))?;
         let provider_id = params.provider.as_deref()
             .unwrap_or(&cfg.default_generation_provider)
             .to_string();
 
-        let api_key = cfg.api_keys.get(&provider_id)
-            .ok_or(format!("未配置 {} API Key，请在 AI 设置中配置", provider_id))?
-            .clone();
-
         let provider_config = cfg.providers.iter()
             .find(|p| p.id == provider_id)
             .ok_or(format!("未找到 Provider: {}", provider_id))?
+            .clone();
+        if !provider_config.enabled
+            || !provider_config
+                .capabilities
+                .iter()
+                .any(|capability| capability == "TextToPixel")
+        {
+            return Err(format!("Provider {} 未启用像素画生成能力", provider_id));
+        }
+        let api_key = cfg.api_keys.get(&provider_id)
+            .ok_or(format!("未配置 {} API Key，请在 AI 设置中配置", provider_id))?
             .clone();
 
         (provider_id, api_key, provider_config)
     }; // cfg 自动 drop
 
-    let enhanced_prompt = build_pixel_prompt(&params);
-    let mut results = Vec::new();
+      let enhanced_prompt = build_pixel_prompt(&params);
 
-    let count = params.num_variants.max(1);
-    for i in 0..count {
+      let count = params.num_variants;
+      for i in 0..count {
+        jobs.ensure_active(&job_id, &project_id)?;
         app.emit("generation-progress", serde_json::json!({
+            "jobId": job_id, "projectId": project_id,
             "stage": "generating", "current": i + 1, "total": count
         })).ok();
 
@@ -123,10 +303,11 @@ pub async fn generate_pixel_art(
 
         // 根据后端类型调用不同 API
         let img_bytes = if provider_id == "stability" {
-            generate_stability(&provider_config, &api_key, &enhanced_prompt, &params, seed)?
+            generate_stability(&provider_config, &api_key, &enhanced_prompt, &params, seed).await?
         } else {
             generate_openai(&provider_config, &api_key, &enhanced_prompt, &params).await?
         };
+        jobs.ensure_active(&job_id, &project_id)?;
 
         // 降采样到目标尺寸（DALL-E 最小 1024x1024）
         let img = image::load_from_memory(&img_bytes)
@@ -153,6 +334,11 @@ pub async fn generate_pixel_art(
         let thumb_path = gen_dir.join(&thumb_name);
         thumb.save(&thumb_path)
             .map_err(|e| format!("保存缩略图失败: {}", e))?;
+        if let Err(error) = jobs.ensure_active(&job_id, &project_id) {
+            let _ = std::fs::remove_file(&file_path);
+            let _ = std::fs::remove_file(&thumb_path);
+            return Err(error);
+        }
 
         let asset = GeneratedAsset {
             id: asset_id.clone(),
@@ -166,7 +352,7 @@ pub async fn generate_pixel_art(
             height: params.height,
             palette: params.palette.clone(),
             seed: Some(seed),
-            provider: "openai".to_string(),
+            provider: provider_id.clone(),
             file_path: file_path.to_string_lossy().to_string(),
             thumbnail_path: thumb_path.to_string_lossy().to_string(),
             created_at: chrono::Utc::now().timestamp_millis(),
@@ -178,7 +364,7 @@ pub async fn generate_pixel_art(
 
         // 保存到数据库
         let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
-        conn.execute(
+        let insert_result = conn.execute(
             "INSERT INTO generated_assets (id, project_id, name, asset_type, prompt, negative_prompt, style, width, height, palette, seed, provider, file_path, thumbnail_path, created_at, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 asset.id,
@@ -198,17 +384,78 @@ pub async fn generate_pixel_art(
                 asset.created_at,
                 asset.metadata.as_ref().map(|m| serde_json::to_string(m).unwrap_or_default()),
             ],
-        ).map_err(|e| format!("保存生成资产失败: {}", e))?;
+        );
         drop(conn);
+        if let Err(error) = insert_result {
+            let _ = std::fs::remove_file(&file_path);
+            let _ = std::fs::remove_file(&thumb_path);
+            return Err(format!("保存生成资产失败: {}", error));
+        }
 
         results.push(asset);
+      }
+
+      app.emit("generation-progress", serde_json::json!({
+          "jobId": job_id, "projectId": project_id,
+          "stage": "done", "current": count, "total": count
+      })).ok();
+
+      Ok(results.clone())
     }
+    .await;
 
-    app.emit("generation-progress", serde_json::json!({
-        "stage": "done", "current": count, "total": count
-    })).ok();
+    let completed_while_active = jobs.finish(&job_id, &project_id);
+    if outcome.is_ok() && !completed_while_active {
+        outcome = Err(GENERATION_CANCELLED.to_string());
+    }
+    if outcome.is_err() {
+        cleanup_generated_assets(&db, &results);
+    }
+    if outcome.as_deref().err() == Some(GENERATION_CANCELLED) {
+        app.emit(
+            "generation-progress",
+            serde_json::json!({
+                "jobId": job_id, "projectId": project_id,
+                "stage": "cancelled", "current": 0, "total": params.num_variants
+            }),
+        )
+        .ok();
+        log::info!(
+            "generation job cancelled: job_id={}, project_id={}",
+            job_id,
+            project_id
+        );
+    } else if outcome.is_err() {
+        log::warn!(
+            "generation job failed: job_id={}, project_id={}",
+            job_id,
+            project_id
+        );
+    } else {
+        log::info!(
+            "generation job completed: job_id={}, project_id={}, candidates={}",
+            job_id,
+            project_id,
+            results.len()
+        );
+    }
+    outcome
+}
 
-    Ok(results)
+#[tauri::command]
+pub fn cancel_generation(
+    jobs: State<'_, GenerationJobRegistry>,
+    job_id: String,
+    project_id: String,
+) -> Result<bool, String> {
+    let accepted = jobs.request_cancel(&job_id, &project_id)?;
+    log::info!(
+        "generation cancellation received: job_id={}, project_id={}, accepted={}",
+        job_id,
+        project_id,
+        accepted
+    );
+    Ok(accepted)
 }
 
 #[tauri::command]
@@ -250,13 +497,15 @@ pub fn list_generated_assets(
                 style,
                 width,
                 height,
-                palette: palette_str.and_then(|s: String| serde_json::from_str::<Vec<String>>(&s).ok()),
+                palette: palette_str
+                    .and_then(|s: String| serde_json::from_str::<Vec<String>>(&s).ok()),
                 seed: seed.map(|s| s as u64),
                 provider,
                 file_path,
                 thumbnail_path,
                 created_at,
-                metadata: metadata_str.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                metadata: metadata_str
+                    .and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
             })
         })
         .map_err(|e| format!("读取生成资产失败: {}", e))?
@@ -267,25 +516,54 @@ pub fn list_generated_assets(
 }
 
 #[tauri::command]
-pub fn delete_generated_asset(db: State<'_, DbState>, asset_id: String) -> Result<(), String> {
+pub fn delete_generated_asset(
+    db: State<'_, DbState>,
+    asset_id: String,
+    project_id: String,
+) -> Result<(), String> {
     let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
-    // 获取文件路径用于删除
-    let file_path: String = conn.query_row(
-        "SELECT file_path FROM generated_assets WHERE id = ?1",
-        params![asset_id],
-        |row| row.get(0),
-    ).map_err(|e| format!("查找资产失败: {}", e))?;
-
-    // 删除文件
-    let _ = std::fs::remove_file(&file_path);
-    // 也尝试删除缩略图
-    let _ = std::fs::remove_file(format!("{}/thumb_{}.png",
-        std::path::Path::new(&file_path).parent().unwrap_or(std::path::Path::new(".")).to_string_lossy(),
-        asset_id
-    ));
-
-    conn.execute("DELETE FROM generated_assets WHERE id = ?1", params![asset_id])
-        .map_err(|e| format!("删除资产失败: {}", e))?;
+    let (file_path, thumbnail_path): (String, String) = conn
+        .query_row(
+            "SELECT file_path, thumbnail_path FROM generated_assets WHERE id = ?1 AND project_id = ?2",
+            params![asset_id, project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| format!("查找资产失败: {}", e))?;
+    let timeline_reference_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets WHERE source_path = ?1",
+            params![file_path],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("检查资产引用失败: {}", e))?;
+    conn.execute(
+        "DELETE FROM generated_assets WHERE id = ?1 AND project_id = ?2",
+        params![asset_id, project_id],
+    )
+    .map_err(|e| format!("删除资产失败: {}", e))?;
+    drop(conn);
+    let paths = if timeline_reference_count == 0 {
+        vec![file_path.as_str(), thumbnail_path.as_str()]
+    } else {
+        log::info!(
+            "generated source retained for timeline references: asset_id={}, project_id={}, references={}",
+            asset_id,
+            project_id,
+            timeline_reference_count
+        );
+        vec![thumbnail_path.as_str()]
+    };
+    for path in paths {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "generated asset file cleanup failed: asset_id={}, project_id={}",
+                    asset_id,
+                    project_id
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -300,28 +578,27 @@ pub fn add_generated_to_timeline(
 
     // 获取生成资产信息
     let (file_path, name, width, height): (String, String, u32, u32) = conn.query_row(
-        "SELECT file_path, name, width, height FROM generated_assets WHERE id = ?1",
-        params![asset_id],
+        "SELECT file_path, name, width, height FROM generated_assets WHERE id = ?1 AND project_id = ?2",
+        params![asset_id, project_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     ).map_err(|e| format!("查找资产失败: {}", e))?;
 
+    let create_track = track_id.is_none();
     let tid = match track_id {
-        Some(id) => id,
-        None => {
-            // 创建新轨道
-            let new_track_id = uuid::Uuid::new_v4().to_string();
-            let track_order: i64 = conn.query_row(
-                "SELECT COALESCE(MAX(track_order), -1) + 1 FROM tracks WHERE project_id = ?1",
-                params![project_id],
-                |row| row.get(0),
-            ).unwrap_or(0);
-
-            conn.execute(
-                "INSERT INTO tracks (id, project_id, name, type, track_order) VALUES (?1, ?2, ?3, 'image_sequence', ?4)",
-                params![new_track_id, project_id, format!("生成: {}", name), track_order],
-            ).map_err(|e| format!("创建轨道失败: {}", e))?;
-            new_track_id
+        Some(id) => {
+            let track_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tracks WHERE id = ?1 AND project_id = ?2",
+                    params![id, project_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("验证轨道失败: {}", e))?;
+            if track_count != 1 {
+                return Err("目标轨道不属于当前项目".to_string());
+            }
+            id
         }
+        None => uuid::Uuid::new_v4().to_string(),
     };
 
     // 导入到轨道
@@ -333,7 +610,8 @@ pub fn add_generated_to_timeline(
     ).unwrap_or(0);
 
     // 生成缩略图到项目目录
-    let thumb_dir = std::path::Path::new(&file_path).parent()
+    let thumb_dir = std::path::Path::new(&file_path)
+        .parent()
         .map(|p| p.join("thumbs"))
         .unwrap_or_else(|| std::path::PathBuf::from("thumbs"));
     std::fs::create_dir_all(&thumb_dir).ok();
@@ -341,12 +619,49 @@ pub fn add_generated_to_timeline(
 
     let img = image::open(&file_path).map_err(|e| format!("打开图片失败: {}", e))?;
     let thumb = img.resize_exact(120, 68, image::imageops::FilterType::Nearest);
-    thumb.save(&thumb_path).map_err(|e| format!("保存缩略图失败: {}", e))?;
+    thumb
+        .save(&thumb_path)
+        .map_err(|e| format!("保存缩略图失败: {}", e))?;
 
-    conn.execute(
-        "INSERT INTO assets (id, track_id, name, source_type, source_path, thumbnail_path, start_frame, width, height) VALUES (?1, ?2, ?3, 'generated', ?4, ?5, ?6, ?7, ?8)",
-        params![new_asset_id, tid, name, file_path, thumb_path.to_string_lossy().to_string(), start_frame, width, height],
-    ).map_err(|e| format!("导入资产失败: {}", e))?;
+    let persist_result = (|| -> Result<(), String> {
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("开始采用候选事务失败: {}", e))?;
+        if create_track {
+            let track_order: i64 = transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(track_order), -1) + 1 FROM tracks WHERE project_id = ?1",
+                    params![project_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            transaction
+                .execute(
+                    "INSERT INTO tracks (id, project_id, name, type, track_order) VALUES (?1, ?2, ?3, 'image_sequence', ?4)",
+                    params![tid, project_id, format!("生成: {}", name), track_order],
+                )
+                .map_err(|e| format!("创建轨道失败: {}", e))?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO assets (id, track_id, name, source_type, source_path, thumbnail_path, start_frame, width, height) VALUES (?1, ?2, ?3, 'generated', ?4, ?5, ?6, ?7, ?8)",
+                params![new_asset_id, tid, name, file_path, thumb_path.to_string_lossy().to_string(), start_frame, width, height],
+            )
+            .map_err(|e| format!("导入资产失败: {}", e))?;
+        transaction
+            .commit()
+            .map_err(|e| format!("提交采用候选事务失败: {}", e))
+    })();
+    if let Err(error) = persist_result {
+        let _ = std::fs::remove_file(&thumb_path);
+        return Err(error);
+    }
+    log::info!(
+        "generated candidate adopted: asset_id={}, project_id={}, track_id={}",
+        asset_id,
+        project_id,
+        tid
+    );
 
     Ok(tid)
 }
@@ -357,7 +672,9 @@ async fn generate_openai(
     prompt: &str,
     params: &TextToPixelParams,
 ) -> Result<Vec<u8>, String> {
-    let base_url = provider_config.config.get("baseUrl")
+    let base_url = provider_config
+        .config
+        .get("baseUrl")
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.openai.com/v1")
         .to_string();
@@ -384,37 +701,43 @@ async fn generate_openai(
         return Err(format!("OpenAI API 返回错误 {}: {}", status, body));
     }
 
-    let json: serde_json::Value = response.json().await
+    let json: serde_json::Value = response
+        .json()
+        .await
         .map_err(|e| format!("解析响应失败: {}", e))?;
 
     let b64_data = json["data"][0]["b64_json"]
         .as_str()
         .ok_or("响应中缺少图片数据")?;
 
-    base64::engine::general_purpose::STANDARD.decode(b64_data)
+    base64::engine::general_purpose::STANDARD
+        .decode(b64_data)
         .map_err(|e| format!("解码图片失败: {}", e))
 }
 
 /// 调用 Stability AI API
-fn generate_stability(
+async fn generate_stability(
     provider_config: &ProviderConfig,
     api_key: &str,
     prompt: &str,
     params: &TextToPixelParams,
     seed: u64,
 ) -> Result<Vec<u8>, String> {
-    let base_url = provider_config.config.get("baseUrl")
+    let base_url = provider_config
+        .config
+        .get("baseUrl")
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.stability.ai/v1")
         .to_string();
 
-    let engine = provider_config.config.get("engine")
+    let engine = provider_config
+        .config
+        .get("engine")
         .and_then(|v| v.as_str())
         .unwrap_or("stable-diffusion-xl-1.0")
         .to_string();
 
-    // Stability AI 使用同步 reqwest blocking client
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::Client::new();
     let response = client
         .post(format!("{}/generation/{}/text-to-image", base_url, engine))
         .header("Authorization", format!("Bearer {}", api_key))
@@ -433,21 +756,83 @@ fn generate_stability(
             "style_preset": "pixel-art"
         }))
         .send()
+        .await
         .map_err(|e| format!("Stability AI 请求失败: {}", e))?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().unwrap_or_default();
+        let body = response.text().await.unwrap_or_default();
         return Err(format!("Stability AI 返回错误 {}: {}", status, body));
     }
 
-    let json: serde_json::Value = response.json()
+    let json: serde_json::Value = response
+        .json()
+        .await
         .map_err(|e| format!("解析响应失败: {}", e))?;
 
     let b64_data = json["artifacts"][0]["base64"]
         .as_str()
         .ok_or("响应中缺少图片数据")?;
 
-    base64::engine::general_purpose::STANDARD.decode(b64_data)
+    base64::engine::general_purpose::STANDARD
+        .decode(b64_data)
         .map_err(|e| format!("解码图片失败: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_generation_request, GenerationJobRegistry, TextToPixelParams};
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    fn params() -> TextToPixelParams {
+        TextToPixelParams {
+            prompt: "idle hero".to_string(),
+            negative_prompt: None,
+            style: "16bit".to_string(),
+            width: 64,
+            height: 64,
+            palette: None,
+            seed: Some(1),
+            num_variants: 1,
+            provider: Some("openai".to_string()),
+        }
+    }
+
+    #[test]
+    fn cancellation_requires_matching_job_and_project() {
+        let jobs = GenerationJobRegistry::default();
+        jobs.register("job-a", "project-a").expect("register");
+
+        assert!(!jobs
+            .request_cancel("job-a", "project-b")
+            .expect("wrong project"));
+        assert!(jobs.ensure_active("job-a", "project-a").is_ok());
+        assert!(jobs
+            .request_cancel("job-a", "project-a")
+            .expect("matching project"));
+        assert_eq!(
+            jobs.ensure_active("job-a", "project-a").unwrap_err(),
+            "GENERATION_CANCELLED"
+        );
+        assert!(!jobs.finish("job-a", "project-a"));
+    }
+
+    #[test]
+    fn generation_request_validation_rejects_missing_projects_and_unsafe_bounds() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .execute("CREATE TABLE projects (id TEXT PRIMARY KEY)", [])
+            .expect("projects table");
+        connection
+            .execute("INSERT INTO projects (id) VALUES ('project-a')", [])
+            .expect("project");
+        let db = Mutex::new(connection);
+
+        assert!(validate_generation_request(&db, "project-a", &params()).is_ok());
+        let mut invalid = params();
+        invalid.num_variants = 5;
+        assert!(validate_generation_request(&db, "project-a", &invalid).is_err());
+        assert!(validate_generation_request(&db, "missing", &params()).is_err());
+    }
 }

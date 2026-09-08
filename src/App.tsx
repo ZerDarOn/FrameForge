@@ -20,6 +20,8 @@ import { PropertiesPanel } from "./components/panels/PropertiesPanel";
 import { Timeline } from "./components/timeline/Timeline";
 import { WelcomeDialog } from "./components/dialogs/WelcomeDialog";
 import { ProjectSettingsDialog } from "./components/dialogs/ProjectSettingsDialog";
+import { SpriteSheetImportDialog } from "./components/dialogs/SpriteSheetImportDialog";
+import { GifImportDialog } from "./components/dialogs/GifImportDialog";
 
 export default function App() {
   const project = useProjectStore((s) => s.project);
@@ -33,6 +35,8 @@ export default function App() {
   const setTimelineHeight = useUIStore((s) => s.setTimelineHeight);
   const [showWelcome, setShowWelcome] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
+  const [showSpriteSheetImport, setShowSpriteSheetImport] = useState(false);
+  const [showGifImport, setShowGifImport] = useState(false);
 
   useKeyboardShortcuts();
   useUnsavedChangesGuard();
@@ -53,11 +57,21 @@ export default function App() {
     const showSettingsHandler = () => {
       if (useProjectStore.getState().loadStatus === "ready") setShowSettings(true);
     };
+    const showSpriteSheetImportHandler = () => {
+      if (useProjectStore.getState().loadStatus === "ready") setShowSpriteSheetImport(true);
+    };
+    const showGifImportHandler = () => {
+      if (useProjectStore.getState().loadStatus === "ready") setShowGifImport(true);
+    };
     window.addEventListener("frameforge:show-welcome", showWelcomeHandler);
     window.addEventListener("frameforge:show-settings", showSettingsHandler);
+    window.addEventListener("frameforge:import-sprite-sheet", showSpriteSheetImportHandler);
+    window.addEventListener("frameforge:import-gif", showGifImportHandler);
     return () => {
       window.removeEventListener("frameforge:show-welcome", showWelcomeHandler);
       window.removeEventListener("frameforge:show-settings", showSettingsHandler);
+      window.removeEventListener("frameforge:import-sprite-sheet", showSpriteSheetImportHandler);
+      window.removeEventListener("frameforge:import-gif", showGifImportHandler);
     };
   }, []);
 
@@ -74,6 +88,14 @@ export default function App() {
 
         {showSettings && project && loadStatus === "ready" && (
           <ProjectSettingsDialog onClose={() => setShowSettings(false)} />
+        )}
+
+        {showSpriteSheetImport && project && loadStatus === "ready" && (
+          <SpriteSheetImportDialog onClose={() => setShowSpriteSheetImport(false)} />
+        )}
+
+        {showGifImport && project && loadStatus === "ready" && (
+          <GifImportDialog onClose={() => setShowGifImport(false)} />
         )}
 
         {project && loadStatus !== "ready" && (

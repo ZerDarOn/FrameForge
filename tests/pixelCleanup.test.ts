@@ -1,0 +1,114 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  analyzePixelPalette,
+  reducePixelPalette,
+  removeColorAsTransparency,
+} from "../src/core/pixelCleanup.ts";
+import type { PixelImage } from "../src/types/pixelImage.ts";
+
+function image(width: number, height: number, pixels: number[]): PixelImage {
+  return { width, height, data: new Uint8ClampedArray(pixels) };
+}
+
+test("palette analysis ignores transparent pixels and sorts colors by usage", () => {
+  const source = image(4, 1, [
+    255, 0, 0, 255,
+    0, 0, 255, 255,
+    255, 0, 0, 255,
+    10, 20, 30, 0,
+  ]);
+
+  const result = analyzePixelPalette(source, 8);
+
+  assert.equal(result.opaquePixels, 3);
+  assert.equal(result.transparentPixels, 1);
+  assert.equal(result.uniqueColorCount, 2);
+  assert.deepEqual(result.colors, [
+    { color: [255, 0, 0, 255], count: 2 },
+    { color: [0, 0, 255, 255], count: 1 },
+  ]);
+});
+
+test("background transparency is immutable and clears exact matches", () => {
+  const source = image(3, 1, [
+    20, 30, 40, 255,
+    21, 30, 40, 255,
+    20, 30, 40, 0,
+  ]);
+
+  const result = removeColorAsTransparency(source, [20, 30, 40, 255], 0);
+
+  assert.equal(result.changedPixels, 1);
+  assert.deepEqual([...source.data], [
+    20, 30, 40, 255,
+    21, 30, 40, 255,
+    20, 30, 40, 0,
+  ]);
+  assert.deepEqual([...result.image.data], [
+    0, 0, 0, 0,
+    21, 30, 40, 255,
+    20, 30, 40, 0,
+  ]);
+});
+
+test("background transparency uses bounded per-channel tolerance", () => {
+  const source = image(2, 1, [
+    110, 95, 100, 255,
+    111, 95, 100, 255,
+  ]);
+
+  assert.equal(removeColorAsTransparency(source, [100, 100, 100, 255], 10).changedPixels, 1);
+  assert.throws(
+    () => removeColorAsTransparency(source, [100, 100, 100, 255], 256),
+    /tolerance/,
+  );
+  assert.throws(() => analyzePixelPalette(source, 0), /maxColors/);
+});
+
+test("palette reduction deterministically groups colors and preserves alpha", () => {
+  const source = image(5, 1, [
+    0, 0, 0, 255,
+    64, 64, 64, 128,
+    192, 192, 192, 255,
+    255, 255, 255, 64,
+    123, 45, 67, 0,
+  ]);
+
+  const result = reducePixelPalette(source, 2);
+
+  assert.deepEqual(result.palette, [
+    [32, 32, 32, 255],
+    [224, 224, 224, 255],
+  ]);
+  assert.equal(result.changedPixels, 4);
+  assert.deepEqual([...result.image.data], [
+    32, 32, 32, 255,
+    32, 32, 32, 128,
+    224, 224, 224, 255,
+    224, 224, 224, 64,
+    123, 45, 67, 0,
+  ]);
+  assert.deepEqual([...source.data], [
+    0, 0, 0, 255,
+    64, 64, 64, 128,
+    192, 192, 192, 255,
+    255, 255, 255, 64,
+    123, 45, 67, 0,
+  ]);
+});
+
+test("palette reduction is a no-op when the requested palette already fits", () => {
+  const source = image(2, 1, [255, 0, 0, 255, 0, 0, 255, 100]);
+
+  const result = reducePixelPalette(source, 2);
+
+  assert.equal(result.image, source);
+  assert.equal(result.changedPixels, 0);
+  assert.deepEqual(result.palette, [
+    [0, 0, 255, 255],
+    [255, 0, 0, 255],
+  ]);
+  assert.throws(() => reducePixelPalette(source, 1), /maxColors/);
+  assert.throws(() => reducePixelPalette(source, 33), /maxColors/);
+});

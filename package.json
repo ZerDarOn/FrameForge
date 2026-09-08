@@ -1,11 +1,12 @@
 {
   "name": "frameforge",
   "version": "0.1.0",
-  "description": "AI 动画帧审查与对齐工具",
+  "description": "像素帧动画编辑器与 AI 辅助审查工具",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:core": "node --test --experimental-strip-types tests/*.test.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

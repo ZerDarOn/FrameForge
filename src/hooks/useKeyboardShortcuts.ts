@@ -1,12 +1,16 @@
 import { useEffect } from "react";
-import { useTimelineStore, undo, redo } from "../stores/timelineStore";
+import { useTimelineStore } from "../stores/timelineStore";
 import { useUIStore } from "../stores/uiStore";
+import { isGlobalShortcutAllowed } from "../core/keyboardScope";
 
 export function useKeyboardShortcuts() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
+      const hasBlockingSurface = Boolean(
+        document.querySelector('[data-frameforge-block-shortcuts="true"]'),
+      );
+      if (!isGlobalShortcutAllowed(target?.tagName ?? null, hasBlockingSurface)) return;
 
       const state = useTimelineStore.getState();
       const { currentFrame, totalFrames, selectedAssetId, viewport } = state;
@@ -82,13 +86,13 @@ export function useKeyboardShortcuts() {
         case "z":
           if (e.ctrlKey || e.metaKey) {
             e.preventDefault();
-            undo();
+            state.undo();
           }
           break;
         case "y":
           if (e.ctrlKey || e.metaKey) {
             e.preventDefault();
-            redo();
+            state.redo();
           }
           break;
         case "n":

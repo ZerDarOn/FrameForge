@@ -2,6 +2,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore } from "../../stores/projectStore";
 import { useTimelineStore } from "../../stores/timelineStore";
+import { useAnimationDocumentStore } from "../../stores/animationDocumentStore";
 
 export function ProjectSettingsDialog({ onClose }: { onClose: () => void }) {
   const project = useProjectStore((s) => s.project);
@@ -23,7 +24,15 @@ export function ProjectSettingsDialog({ onClose }: { onClose: () => void }) {
         canvasHeight: height,
         fps,
       });
+      const updatedProject = {
+        ...project,
+        name,
+        canvasWidth: width,
+        canvasHeight: height,
+        fps,
+      };
       updateProject({ name, canvasWidth: width, canvasHeight: height, fps });
+      useAnimationDocumentStore.getState().updateProjectSettings(updatedProject);
       setTimelineFps(fps);
       onClose();
     } catch (err) {

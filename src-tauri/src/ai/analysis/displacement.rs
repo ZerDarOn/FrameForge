@@ -1,46 +1,65 @@
 use crate::ai::providers::FrameDisplacement;
 
-/// 基于像素差的简易位移检测（MVP 版本）
-/// 通过 NCC（归一化互相关）比较相邻帧来估计位移
+/// 加载帧并解码为 RGBA 字节
+pub fn load_frame_rgba(path: &str) -> Result<(Vec<u8>, u32, u32), String> {
+    let data = std::fs::read(path).map_err(|e| format!("读取帧失败: {}", e))?;
+    let img = image::load_from_memory(&data).map_err(|e| format!("解码帧失败: {}", e))?;
+    let rgba = img.to_rgba8();
+    let dimensions = rgba.dimensions();
+    Ok((rgba.into_raw(), dimensions.0, dimensions.1))
+}
+
+/// 检测相邻两帧间的位移（逐对调用，无需全量数据）
+pub fn detect_displacement_pair(
+    frame_a: &[u8],
+    width_a: u32,
+    height_a: u32,
+    frame_b: &[u8],
+    width_b: u32,
+    height_b: u32,
+    frame_index: i64,
+) -> FrameDisplacement {
+    let (dx, dy) = estimate_shift(frame_a, width_a, height_a, frame_b, width_b, height_b);
+    let magnitude = (dx * dx + dy * dy).sqrt();
+    let severity = if magnitude > 3.0 {
+        "high"
+    } else if magnitude > 1.0 {
+        "medium"
+    } else {
+        "low"
+    };
+    FrameDisplacement {
+        frame_index,
+        dx,
+        dy,
+        magnitude,
+        severity: severity.to_string(),
+    }
+}
+
+/// 基于像素差的简易位移检测（保留原签名兼容性）
 pub fn detect_displacement_simple(
     frames: &[Vec<u8>],
     widths: &[u32],
     heights: &[u32],
 ) -> Vec<FrameDisplacement> {
     let mut results = Vec::new();
-
     for i in 1..frames.len() {
-        let (dx, dy) = estimate_shift(
-            &frames[i - 1], widths[i - 1], heights[i - 1],
-            &frames[i], widths[i], heights[i],
-        );
-
-        let magnitude = (dx * dx + dy * dy).sqrt();
-        let severity = if magnitude > 3.0 {
-            "high"
-        } else if magnitude > 1.0 {
-            "medium"
-        } else {
-            "low"
-        };
-
-        results.push(FrameDisplacement {
-            frame_index: i as i64,
-            dx,
-            dy,
-            magnitude,
-            severity: severity.to_string(),
-        });
+        results.push(detect_displacement_pair(
+            &frames[i - 1],
+            widths[i - 1],
+            heights[i - 1],
+            &frames[i],
+            widths[i],
+            heights[i],
+            i as i64,
+        ));
     }
-
     results
 }
 
 /// 使用 NCC 估计两帧间的位移
-fn estimate_shift(
-    img1: &[u8], w1: u32, h1: u32,
-    img2: &[u8], w2: u32, h2: u32,
-) -> (f64, f64) {
+fn estimate_shift(img1: &[u8], w1: u32, h1: u32, img2: &[u8], w2: u32, h2: u32) -> (f64, f64) {
     let gray1 = to_gray(img1, w1, h1);
     let gray2 = to_gray(img2, w2, h2);
 
@@ -97,7 +116,13 @@ fn estimate_shift(
 
 fn to_gray(data: &[u8], width: u32, height: u32) -> Vec<f64> {
     let pixel_count = (width as usize) * (height as usize);
-    let channels = if data.len() >= pixel_count * 4 { 4 } else if data.len() >= pixel_count * 3 { 3 } else { 1 };
+    let channels = if data.len() >= pixel_count * 4 {
+        4
+    } else if data.len() >= pixel_count * 3 {
+        3
+    } else {
+        1
+    };
     data.chunks(channels)
         .map(|px| {
             if channels >= 3 {

@@ -11,17 +11,22 @@ interface Props {
 
 export function Track({ track, frameWidth, frameHeight }: Props) {
   const selectedAssetId = useTimelineStore((s) => s.selectedAssetId);
+  const selectedAssetIds = useTimelineStore((s) => s.selectedAssetIds);
   const setSelectedAsset = useTimelineStore((s) => s.setSelectedAsset);
   const currentFrame = useTimelineStore((s) => s.currentFrame);
   const setCurrentFrame = useTimelineStore((s) => s.setCurrentFrame);
+  const totalFrames = useTimelineStore((s) => s.totalFrames);
   const deleteAsset = useTimelineStore((s) => s.deleteAsset);
   const duplicateAsset = useTimelineStore((s) => s.duplicateAsset);
   const insertBlankFrame = useTimelineStore((s) => s.insertBlankFrame);
+  const moveAssetToPosition = useTimelineStore((s) => s.moveAssetToPosition);
+  const extractAssetToNewTrack = useTimelineStore((s) => s.extractAssetToNewTrack);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
     assetId: string;
   } | null>(null);
+  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const framesContainerRef = useRef<HTMLDivElement>(null);
 
   const handleContextMenu = (e: React.MouseEvent, assetId: string) => {
@@ -63,26 +68,66 @@ export function Track({ track, frameWidth, frameHeight }: Props) {
         className="flex-1 flex items-center overflow-x-auto px-1 gap-0.5 relative"
         onClick={closeContextMenu}
       >
-        {track.assets.map((asset, index) => (
-          <FrameThumbnail
-            key={asset.id}
-            asset={asset}
-            isSelected={selectedAssetId === asset.id}
-            isCurrentFrame={index === currentFrame}
-            onClick={() => {
-              setSelectedAsset(asset.id);
-              setCurrentFrame(index);
-            }}
-            onContextMenu={(e) => handleContextMenu(e, asset.id)}
-            width={frameWidth}
-            height={frameHeight}
-          />
-        ))}
+        {track.assets.map((asset) => {
+          const assetStartFrame = asset.startFrame;
+          return (
+            <div
+              key={asset.id}
+              className="relative flex-shrink-0"
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOverIndex(assetStartFrame);
+              }}
+              onDragLeave={() => setDragOverIndex(null)}
+              onDrop={(e) => {
+                e.preventDefault();
+                const draggedAssetId = e.dataTransfer.getData("text/plain");
+                if (draggedAssetId && draggedAssetId !== asset.id) {
+                  let targetPos = assetStartFrame;
+                  // 如果拖到右侧（目标帧之后），插入到目标帧后面
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const midX = rect.left + rect.width / 2;
+                  if (e.clientX > midX) {
+                    targetPos = assetStartFrame + 1;
+                  }
+                  moveAssetToPosition(track.id, draggedAssetId, targetPos);
+                }
+                setDragOverIndex(null);
+              }}
+            >
+              {/* 拖放指示线 */}
+              {dragOverIndex === assetStartFrame && (
+                <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-orange-400 z-20" style={{ marginLeft: -1 }} />
+              )}
+              <FrameThumbnail
+                asset={asset}
+                isSelected={selectedAssetIds.includes(asset.id) || selectedAssetId === asset.id}
+                isCurrentFrame={assetStartFrame === currentFrame}
+                onClick={(event) => {
+                  setSelectedAsset(
+                    asset.id,
+                    event.shiftKey || event.ctrlKey || event.metaKey,
+                  );
+                  setCurrentFrame(assetStartFrame);
+                }}
+                onContextMenu={(e) => handleContextMenu(e, asset.id)}
+                width={frameWidth}
+                height={frameHeight}
+                draggable
+                onDragStart={(e: React.DragEvent) => {
+                  e.dataTransfer.setData("text/plain", asset.id);
+                  e.dataTransfer.effectAllowed = "move";
+                }}
+                onDragEnd={() => setDragOverIndex(null)}
+              />
+            </div>
+          );
+        })}
 
         <button
           className="flex-shrink-0 border-2 border-dashed border-gray-700 hover:border-gray-500 flex items-center justify-center text-gray-600 hover:text-gray-400 text-sm"
           style={{ width: frameWidth, height: frameHeight }}
-          onClick={() => insertBlankFrame(track.id, track.assets.length)}
+          onClick={() => insertBlankFrame(track.id, totalFrames)}
           title="在此位置插入空白帧"
         >
           +
@@ -113,6 +158,16 @@ export function Track({ track, frameWidth, frameHeight }: Props) {
             }}
           >
             前方插入空白帧
+          </button>
+          <div className="border-t border-gray-600 my-1" />
+          <button
+            className="w-full px-4 py-1.5 text-left hover:bg-gray-700 text-gray-300"
+            onClick={() => {
+              extractAssetToNewTrack(track.id, contextMenu.assetId);
+              closeContextMenu();
+            }}
+          >
+            提取到新轨道
           </button>
           <div className="border-t border-gray-600 my-1" />
           <button

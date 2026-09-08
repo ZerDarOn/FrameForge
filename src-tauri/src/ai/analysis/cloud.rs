@@ -1,5 +1,70 @@
 use crate::ai::config::ProviderConfig;
 use crate::ai::providers::{AiSuggestion, ConsistencyResult};
+use std::time::Duration;
+
+const REQUEST_TIMEOUT_SECS: u64 = 60;
+const MAX_RETRIES: u32 = 2;
+const RETRY_DELAY_MS: u64 = 1000;
+
+/// 公共 HTTP 请求逻辑：超时 + 重试
+fn api_post(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    api_key: &str,
+    body: serde_json::Value,
+    request_label: &str,
+) -> Result<serde_json::Value, String> {
+    let mut last_err = String::new();
+
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            log::warn!("{request_label} 第 {attempt} 次重试...");
+            std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS * attempt as u64));
+        }
+
+        let result = client
+            .post(url)
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&body)
+            .send();
+
+        let response = match result {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("{request_label} 请求失败: {e}");
+                // 超时不重试
+                if e.is_timeout() {
+                    return Err(format!(
+                        "{request_label} 请求超时 (>{REQUEST_TIMEOUT_SECS}s)"
+                    ));
+                }
+                if attempt < MAX_RETRIES {
+                    continue;
+                }
+                return Err(last_err);
+            }
+        };
+
+        // 服务端错误（5xx）重试，客户端错误（4xx）不重试
+        if response.status().is_server_error() && attempt < MAX_RETRIES {
+            last_err = format!("{request_label} 服务端错误 {}，将重试", response.status());
+            continue;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(format!("{request_label} API 返回错误 {status}: {body}"));
+        }
+
+        return response
+            .json()
+            .map_err(|e| format!("{request_label} 解析响应失败: {e}"));
+    }
+
+    Err(last_err)
+}
 
 /// 调用 OpenAI GPT-4V 进行一致性检查
 pub fn check_consistency_openai(
@@ -7,17 +72,20 @@ pub fn check_consistency_openai(
     api_key: &str,
     frames_b64: &[String],
 ) -> Result<ConsistencyResult, String> {
-    let base_url = provider_config.config.get("baseUrl")
+    let base_url = provider_config
+        .config
+        .get("baseUrl")
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.openai.com/v1")
         .to_string();
 
-    let model = provider_config.config.get("model")
+    let model = provider_config
+        .config
+        .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("gpt-4o")
         .to_string();
 
-    // 最多检查 10 帧
     let frame_subset: Vec<&String> = frames_b64.iter().take(10).collect();
 
     let mut content = vec![serde_json::json!({
@@ -35,35 +103,23 @@ pub fn check_consistency_openai(
     }
 
     let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(format!("{}/chat/completions", base_url))
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&serde_json::json!({
+    let json = api_post(
+        &client,
+        &format!("{}/chat/completions", base_url),
+        api_key,
+        serde_json::json!({
             "model": model,
-            "messages": [{
-                "role": "user",
-                "content": content
-            }],
+            "messages": [{"role": "user", "content": content}],
             "max_tokens": 500,
             "temperature": 0.3
-        }))
-        .send()
-        .map_err(|e| format!("OpenAI API 请求失败: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(format!("OpenAI API 返回错误 {}: {}", status, body));
-    }
-
-    let json: serde_json::Value = response.json()
-        .map_err(|e| format!("解析响应失败: {}", e))?;
+        }),
+        "一致性检查",
+    )?;
 
     let reply = json["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("{}");
 
-    // 尝试解析 JSON 回复
     let parsed: serde_json::Value = serde_json::from_str(reply).unwrap_or(serde_json::json!({}));
 
     Ok(ConsistencyResult {
@@ -77,27 +133,33 @@ pub fn check_consistency_openai(
 pub fn generate_suggestions_openai(
     provider_config: &ProviderConfig,
     api_key: &str,
-    issues: &[(i64, String, String)], // (frame_index, issue_type, description)
+    issues: &[(i64, String, String)],
 ) -> Result<Vec<AiSuggestion>, String> {
-    let base_url = provider_config.config.get("baseUrl")
+    let base_url = provider_config
+        .config
+        .get("baseUrl")
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.openai.com/v1")
         .to_string();
 
-    let model = provider_config.config.get("model")
+    let model = provider_config
+        .config
+        .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("gpt-4o")
         .to_string();
 
-    let issues_text: Vec<String> = issues.iter()
+    let issues_text: Vec<String> = issues
+        .iter()
         .map(|(idx, itype, desc)| format!("帧 {}: [{}] {}", idx, itype, desc))
         .collect();
 
     let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(format!("{}/chat/completions", base_url))
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&serde_json::json!({
+    let json = api_post(
+        &client,
+        &format!("{}/chat/completions", base_url),
+        api_key,
+        serde_json::json!({
             "model": model,
             "messages": [{
                 "role": "user",
@@ -108,18 +170,9 @@ pub fn generate_suggestions_openai(
             }],
             "max_tokens": 1000,
             "temperature": 0.3
-        }))
-        .send()
-        .map_err(|e| format!("OpenAI API 请求失败: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(format!("OpenAI API 返回错误 {}: {}", status, body));
-    }
-
-    let json: serde_json::Value = response.json()
-        .map_err(|e| format!("解析响应失败: {}", e))?;
+        }),
+        "建议生成",
+    )?;
 
     let reply = json["choices"][0]["message"]["content"]
         .as_str()

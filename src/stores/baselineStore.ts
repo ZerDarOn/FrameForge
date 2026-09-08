@@ -1,7 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type { BaselinePoint, BaselineType } from "../types/baseline";
-import { useProjectStore } from "./projectStore";
 
 interface BaselineState {
   points: BaselinePoint[];
@@ -17,6 +16,8 @@ interface BaselineState {
   setMarkerMode: (active: boolean) => void;
   setMarkerType: (type: BaselineType) => void;
   clearAll: () => void;
+  /** 将当前基准点持久化到后端数据库 */
+  persist: (projectId: string) => Promise<void>;
 }
 
 const COLORS = ["#f97316", "#22c55e", "#3b82f6", "#ef4444", "#a855f7", "#eab308"];
@@ -30,14 +31,6 @@ export const useBaselineStore = create<BaselineState>((set, get) => ({
   setPoints: (points) => set({ points }),
   addPoint: (point) => {
     set((s) => ({ points: [...s.points, point] }));
-    const project = useProjectStore.getState().project;
-    if (project) {
-      const pts = [...get().points];
-      invoke("update_baseline_points", {
-        projectId: project.id,
-        pointsJson: JSON.stringify(pts),
-      }).catch(console.error);
-    }
   },
   removePoint: (id) => {
     set((s) => ({
@@ -54,6 +47,18 @@ export const useBaselineStore = create<BaselineState>((set, get) => ({
   setMarkerMode: (active) => set({ isMarkerMode: active }),
   setMarkerType: (type) => set({ markerType: type }),
   clearAll: () => set({ points: [], activePointId: null }),
+
+  persist: async (projectId) => {
+    const points = get().points;
+    try {
+      await invoke("update_baseline_points", {
+        projectId,
+        pointsJson: JSON.stringify(points),
+      });
+    } catch (err) {
+      console.error("持久化基准点失败:", err);
+    }
+  },
 }));
 
 export function getNextColor(index: number): string {

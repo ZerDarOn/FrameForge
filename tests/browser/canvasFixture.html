@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="UTF-8"><title>FrameForge Canvas Fixture</title></head>
+  <body data-status="running">RUNNING
+    <script type="module">
+      import { AnimationCanvasRenderer } from "/src/engines/animationCanvasRenderer.ts";
+
+      const source = document.createElement("canvas");
+      source.width = 2;
+      source.height = 2;
+      const sourceContext = source.getContext("2d");
+      const pixels = sourceContext.createImageData(2, 2);
+      pixels.data.set([
+        255, 0, 0, 255, 0, 255, 0, 255,
+        0, 0, 255, 255, 0, 0, 0, 0,
+      ]);
+      sourceContext.putImageData(pixels, 0, 0);
+      const sourcePath = source.toDataURL("image/png");
+      const fixture = {
+        schemaVersion: 1,
+        projectId: "browser-canvas-fixture",
+        revision: 0,
+        canvas: { width: 2, height: 2, originX: 1, originY: 1 },
+        palette: [],
+        materials: [{ id: "material", name: "fixture", sourcePath }],
+        contentRevisions: [{ id: "content", materialId: "material", sourcePath, width: 2, height: 2, createdAt: 1 }],
+        animations: [{
+          id: "animation", name: "fixture", direction: null, fps: 12, playbackMode: "once",
+          steps: [{ id: "step", order: 0, durationTicks: 1 }],
+          layers: [{ id: "layer", name: "layer", order: 0, visible: true, locked: false, opacity: 1 }],
+          cels: [{
+            id: "cel", layerId: "layer", stepId: "step", contentRevisionId: "content",
+            transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotationDegrees: 0 },
+          }],
+        }],
+      };
+
+      try {
+        const rendered = await new AnimationCanvasRenderer().renderFrame(fixture, "animation", 0);
+        const actual = Array.from(rendered.getContext("2d").getImageData(0, 0, 2, 2).data);
+        const expected = Array.from(pixels.data);
+        if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+          throw new Error("pixel mismatch: " + JSON.stringify(actual));
+        }
+        document.body.dataset.status = "passed";
+        document.body.textContent = "PASS real Canvas 2D renderer 2x2 RGBA fixture";
+        document.body.style.background = "rgb(5, 46, 22)";
+        document.body.style.color = "rgb(134, 239, 172)";
+      } catch (error) {
+        document.body.dataset.status = "failed";
+        document.body.textContent = "FAIL " + String(error);
+        document.body.style.background = "rgb(69, 10, 10)";
+        document.body.style.color = "rgb(252, 165, 165)";
+      }
+    </script>
+  </body>
+</html>

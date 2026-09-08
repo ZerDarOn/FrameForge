@@ -31,9 +31,7 @@ export const useAiConfigStore = create<AiConfigState>((set, get) => ({
   setApiKey: async (providerId, key) => {
     try {
       await invoke("set_ai_api_key", { providerId, key });
-      const config = { ...get().config! };
-      config.apiKeys = { ...config.apiKeys, [providerId]: "••••••••" };
-      set({ config });
+      await get().loadConfig();
     } catch (err) {
       console.error("设置 API Key 失败:", err);
     }

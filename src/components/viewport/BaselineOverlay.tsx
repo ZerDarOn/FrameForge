@@ -2,6 +2,7 @@ import { useState, useCallback, useRef } from "react";
 import { useBaselineStore, getNextColor } from "../../stores/baselineStore";
 import { useTimelineStore } from "../../stores/timelineStore";
 import { useUIStore } from "../../stores/uiStore";
+import { useProjectStore } from "../../stores/projectStore";
 import type { BaselinePoint } from "../../types/baseline";
 
 interface Props {
@@ -81,6 +82,8 @@ export function BaselineOverlay({ imageRect }: Props) {
           color: getNextColor(points.length),
         };
         addPoint(point);
+        const projectId = useProjectStore.getState().project?.id;
+        if (projectId) useBaselineStore.getState().persist(projectId);
       } else {
         // line 或 region：记录起点
         setTempStart({ x: px, y: py });
@@ -135,6 +138,8 @@ export function BaselineOverlay({ imageRect }: Props) {
           color: getNextColor(points.length),
         };
         addPoint(point);
+        const pid = useProjectStore.getState().project?.id;
+        if (pid) useBaselineStore.getState().persist(pid);
       } else if (markerType === "region") {
         const point: BaselinePoint = {
           id: crypto.randomUUID(),
@@ -150,6 +155,8 @@ export function BaselineOverlay({ imageRect }: Props) {
           color: getNextColor(points.length),
         };
         addPoint(point);
+        const pid2 = useProjectStore.getState().project?.id;
+        if (pid2) useBaselineStore.getState().persist(pid2);
       }
 
       setTempStart(null);

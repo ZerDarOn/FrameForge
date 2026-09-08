@@ -1,15 +1,25 @@
+import { useRef } from "react";
 import { useUIStore } from "../../stores/uiStore";
 import { useTimelineStore } from "../../stores/timelineStore";
 import { useBaselineStore } from "../../stores/baselineStore";
 import { useAnalysisStore } from "../../stores/analysisStore";
+import type { AnalysisReport } from "../../types/analysis";
 import { useProjectStore } from "../../stores/projectStore";
-import { invoke } from "@tauri-apps/api/core";
 
 export function PropertiesPanel() {
   const tab = useUIStore((s) => s.propertiesTab);
   const setTab = useUIStore((s) => s.setPropertiesTab);
   const selectedAssetId = useTimelineStore((s) => s.selectedAssetId);
+  const selectedAssetIds = useTimelineStore((s) => s.selectedAssetIds);
   const tracks = useTimelineStore((s) => s.tracks);
+  const selectedAssetIdSet = new Set(selectedAssetIds);
+  const selectedAssetCount = tracks.reduce(
+    (count, track) => count + track.assets.filter((asset) => selectedAssetIdSet.has(asset.id)).length,
+    0,
+  );
+  const selectedIncludesLockedLayer = tracks.some(
+    (track) => track.locked && track.assets.some((asset) => selectedAssetIdSet.has(asset.id)),
+  );
 
   // 查找选中的资产
   let selectedAsset = null;
@@ -56,7 +66,11 @@ export function PropertiesPanel() {
         ) : tab === "info" ? (
           <FrameInfo asset={selectedAsset} track={selectedTrack!} />
         ) : tab === "transform" ? (
-          <TransformInfo asset={selectedAsset} />
+          selectedAssetCount > 1 ? (
+            <BatchTransformInfo count={selectedAssetCount} disabled={selectedIncludesLockedLayer} />
+          ) : (
+            <TransformInfo asset={selectedAsset} />
+          )
         ) : tab === "baseline" ? (
           <BaselineInfo />
         ) : tab === "ai" ? (
@@ -67,13 +81,65 @@ export function PropertiesPanel() {
   );
 }
 
+interface BatchTransformInfoProps {
+  count: number;
+  disabled: boolean;
+}
+
+function BatchTransformInfo({ count, disabled }: BatchTransformInfoProps) {
+  const nudge = useTimelineStore((state) => state.nudgeSelectedAssets);
+  const alignBottom = useTimelineStore((state) => state.alignSelectedAssetsBottom);
+  const buttonClass = "rounded bg-gray-800 px-3 py-2 text-gray-300 hover:bg-gray-700 disabled:opacity-40";
+  return (
+    <div className="space-y-3">
+      <Section title="批量位移">
+        <div className="mb-2 text-gray-500">已选择 {count} 个画格</div>
+        <div className="grid grid-cols-4 gap-1">
+          <button type="button" aria-label="所选画格左移一像素" className={buttonClass} disabled={disabled} onClick={() => nudge(-1, 0)}>←</button>
+          <button type="button" aria-label="所选画格上移一像素" className={buttonClass} disabled={disabled} onClick={() => nudge(0, -1)}>↑</button>
+          <button type="button" aria-label="所选画格下移一像素" className={buttonClass} disabled={disabled} onClick={() => nudge(0, 1)}>↓</button>
+          <button type="button" aria-label="所选画格右移一像素" className={buttonClass} disabled={disabled} onClick={() => nudge(1, 0)}>→</button>
+        </div>
+      </Section>
+      <Section title="批量对齐">
+        <button
+          type="button"
+          className="w-full rounded bg-gray-800 px-3 py-2 text-gray-300 hover:bg-gray-700 disabled:opacity-40"
+          disabled={disabled}
+          onClick={alignBottom}
+        >
+          底边对齐
+        </button>
+      </Section>
+      {disabled && <div className="text-amber-400">选择中包含锁定图层，整批不会修改。</div>}
+    </div>
+  );
+}
+
 function FrameInfo({ asset, track }: { asset: any; track: any }) {
+  const updateAsset = useTimelineStore((s) => s.updateAsset);
+
   return (
     <div className="space-y-3">
       <Section title="基本信息">
         <Row label="文件名" value={asset.name} />
         <Row label="轨道" value={track.name} />
         <Row label="位置" value={`帧 ${asset.startFrame}`} />
+        <label className="flex items-center justify-between gap-2">
+          <span className="text-gray-500">停留帧数</span>
+          <input
+            type="number"
+            min={1}
+            step={1}
+            value={asset.durationFrames}
+            onChange={(event) =>
+              updateAsset(track.id, asset.id, {
+                durationFrames: Math.max(1, Number.parseInt(event.target.value, 10) || 1),
+              })
+            }
+            className="w-20 rounded border border-gray-600 bg-gray-800 px-2 py-1 text-right text-gray-300"
+          />
+        </label>
         <Row label="尺寸" value={asset.width > 0 ? `${asset.width} x ${asset.height}` : "未知"} />
         <Row label="匹配帧率" value={asset.matchedFps ? "是" : "否"} />
         {asset.sourceTimestamp > 0 && (
@@ -91,45 +157,40 @@ function FrameInfo({ asset, track }: { asset: any; track: any }) {
 
 function TransformInfo({ asset }: { asset: any }) {
   const updateAsset = useTimelineStore((s) => s.updateAsset);
+  const previewAssetUpdate = useTimelineStore((s) => s.previewAssetUpdate);
 
-  const handleUpdate = (field: string, value: number) => {
-    if (!asset) return;
-    const track = useTimelineStore.getState().tracks.find((t) =>
-      t.assets.some((a) => a.id === asset.id)
+  const findTrack = () =>
+    useTimelineStore.getState().tracks.find((track) =>
+      track.assets.some((candidate) => candidate.id === asset.id),
     );
+  const handlePreview = (field: string, value: number) => {
+    const track = findTrack();
+    if (track) previewAssetUpdate(track.id, asset.id, { [field]: value });
+  };
+  const handleCommit = (field: string, value: number) => {
+    if (!asset) return;
+    const track = findTrack();
     if (track) {
       updateAsset(track.id, asset.id, { [field]: value });
-      // 同步后端
-      const a = { ...asset, [field]: value };
-      invoke("update_asset_transform", {
-        assetId: asset.id,
-        transformX: a.transformX,
-        transformY: a.transformY,
-        transformScaleX: a.transformScaleX,
-        transformScaleY: a.transformScaleY,
-        transformRotation: a.transformRotation,
-        alignmentDx: a.alignmentDx,
-        alignmentDy: a.alignmentDy,
-      }).catch(console.error);
     }
   };
 
   return (
     <div className="space-y-3">
       <Section title="位移">
-        <SliderRow label="X" value={asset.transformX} min={-500} max={500} onChange={(v) => handleUpdate("transformX", v)} />
-        <SliderRow label="Y" value={asset.transformY} min={-500} max={500} onChange={(v) => handleUpdate("transformY", v)} />
+        <SliderRow label="X" value={asset.transformX} min={-500} max={500} onPreview={(v) => handlePreview("transformX", v)} onCommit={(v) => handleCommit("transformX", v)} />
+        <SliderRow label="Y" value={asset.transformY} min={-500} max={500} onPreview={(v) => handlePreview("transformY", v)} onCommit={(v) => handleCommit("transformY", v)} />
       </Section>
       <Section title="缩放">
-        <SliderRow label="X" value={asset.transformScaleX} min={0.1} max={3} step={0.1} onChange={(v) => handleUpdate("transformScaleX", v)} />
-        <SliderRow label="Y" value={asset.transformScaleY} min={0.1} max={3} step={0.1} onChange={(v) => handleUpdate("transformScaleY", v)} />
+        <SliderRow label="X" value={asset.transformScaleX} min={0.1} max={3} step={0.1} onPreview={(v) => handlePreview("transformScaleX", v)} onCommit={(v) => handleCommit("transformScaleX", v)} />
+        <SliderRow label="Y" value={asset.transformScaleY} min={0.1} max={3} step={0.1} onPreview={(v) => handlePreview("transformScaleY", v)} onCommit={(v) => handleCommit("transformScaleY", v)} />
       </Section>
       <Section title="旋转">
-        <SliderRow label="角度" value={asset.transformRotation} min={-180} max={180} onChange={(v) => handleUpdate("transformRotation", v)} />
+        <SliderRow label="角度" value={asset.transformRotation} min={-180} max={180} onPreview={(v) => handlePreview("transformRotation", v)} onCommit={(v) => handleCommit("transformRotation", v)} />
       </Section>
       <Section title="对齐偏移">
-        <SliderRow label="DX" value={asset.alignmentDx} min={-100} max={100} onChange={(v) => handleUpdate("alignmentDx", v)} />
-        <SliderRow label="DY" value={asset.alignmentDy} min={-100} max={100} onChange={(v) => handleUpdate("alignmentDy", v)} />
+        <SliderRow label="DX" value={asset.alignmentDx} min={-100} max={100} onPreview={(v) => handlePreview("alignmentDx", v)} onCommit={(v) => handleCommit("alignmentDx", v)} />
+        <SliderRow label="DY" value={asset.alignmentDy} min={-100} max={100} onPreview={(v) => handlePreview("alignmentDy", v)} onCommit={(v) => handleCommit("alignmentDy", v)} />
       </Section>
     </div>
   );
@@ -221,14 +282,22 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-function SliderRow({ label, value, min, max, step = 1, onChange }: {
+function SliderRow({ label, value, min, max, step = 1, onPreview, onCommit }: {
   label: string;
   value: number;
   min: number;
   max: number;
   step?: number;
-  onChange: (v: number) => void;
+  onPreview: (v: number) => void;
+  onCommit: (v: number) => void;
 }) {
+  const dragStartValue = useRef(value);
+  const commit = (nextValue: number) => {
+    if (nextValue === dragStartValue.current) return;
+    dragStartValue.current = nextValue;
+    onCommit(nextValue);
+  };
+
   return (
     <div className="flex items-center gap-2">
       <span className="text-gray-500 w-6">{label}</span>
@@ -238,7 +307,15 @@ function SliderRow({ label, value, min, max, step = 1, onChange }: {
         max={max}
         step={step}
         value={value}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
+        onPointerDown={() => {
+          dragStartValue.current = value;
+        }}
+        onFocus={() => {
+          dragStartValue.current = value;
+        }}
+        onChange={(event) => onPreview(Number.parseFloat(event.target.value))}
+        onPointerUp={(event) => commit(Number.parseFloat(event.currentTarget.value))}
+        onBlur={(event) => commit(Number.parseFloat(event.currentTarget.value))}
         className="flex-1 accent-orange-500 h-1"
       />
       <span className="text-gray-400 w-10 text-right text-[10px]">{value.toFixed(step < 1 ? 1 : 0)}</span>
@@ -256,6 +333,7 @@ function AiAnalysisTab() {
   const project = useProjectStore((s) => s.project);
   const analyzeTrack = useAnalysisStore((s) => s.analyzeTrack);
   const currentFrame = useTimelineStore((s) => s.currentFrame);
+  const setCurrentFrame = useTimelineStore((s) => s.setCurrentFrame);
 
   const activeReport = reports.find((r) => r.id === activeReportId);
   const currentDisplacement = activeReport?.displacement.find((d) => d.frameIndex === currentFrame);
@@ -382,8 +460,65 @@ function AiAnalysisTab() {
               <div className="text-[10px] text-gray-600">此帧无问题</div>
             )}
           </div>
+
+          {/* 问题帧快速跳转列表 */}
+          {activeReport && (
+            <ProblemFrameList
+              report={activeReport}
+              setCurrentFrame={setCurrentFrame}
+              currentFrame={currentFrame}
+            />
+          )}
         </div>
       )}
+    </div>
+  );
+}
+
+function ProblemFrameList({ report, setCurrentFrame, currentFrame }: {
+  report: AnalysisReport;
+  setCurrentFrame: (f: number) => void;
+  currentFrame: number;
+}) {
+  const issues: { frameIndex: number; type: string; severity: string; detail: string }[] = [];
+
+  for (const d of report.displacement) {
+    if (d.severity === "high" || d.severity === "medium") {
+      issues.push({ frameIndex: d.frameIndex, type: "位移", severity: d.severity, detail: `dx=${d.dx.toFixed(1)} dy=${d.dy.toFixed(1)}` });
+    }
+  }
+  for (const f of report.flickerFrames) {
+    if (f.severity === "high" || f.severity === "medium") {
+      issues.push({ frameIndex: f.frameIndex, type: "闪烁", severity: f.severity, detail: `分数=${f.score.toFixed(3)}` });
+    }
+  }
+
+  issues.sort((a, b) => a.frameIndex - b.frameIndex);
+
+  if (issues.length === 0) return null;
+
+  return (
+    <div>
+      <div className="text-gray-400 font-medium text-xs mb-2">问题帧列表 ({issues.length})</div>
+      <div className="space-y-0.5 max-h-48 overflow-y-auto">
+        {issues.map((issue, i) => (
+          <button
+            key={`${issue.frameIndex}-${i}`}
+            className={`w-full text-left px-2 py-1 rounded text-[10px] flex items-center gap-2 transition-colors ${
+              currentFrame === issue.frameIndex
+                ? "bg-orange-900/40 text-orange-300"
+                : issue.severity === "high"
+                  ? "bg-red-900/20 hover:bg-red-900/40 text-red-400"
+                  : "bg-yellow-900/20 hover:bg-yellow-900/40 text-yellow-400"
+            }`}
+            onClick={() => setCurrentFrame(issue.frameIndex)}
+          >
+            <span className="font-mono w-8">#{issue.frameIndex}</span>
+            <span>{issue.type}</span>
+            <span className="text-gray-500 flex-1 truncate">{issue.detail}</span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

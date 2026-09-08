@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { useTimelineStore } from "../../stores/timelineStore";
-import { undo, redo } from "../../stores/timelineStore";
 import { ExportDialog } from "../dialogs/ExportDialog";
 import { AiSettingsDialog } from "../ai/AiSettingsDialog";
 import { useProjectStore } from "../../stores/projectStore";
 import { useAnalysisStore } from "../../stores/analysisStore";
+import { useAnimationDocumentStore } from "../../stores/animationDocumentStore";
+import { AnimationCanvas } from "../viewport/AnimationCanvas";
 
 export function MenuBar() {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
@@ -45,8 +45,8 @@ export function MenuBar() {
           })},
         ]} />
         <MenuDropdown label="编辑" isOpen={openMenu === "edit"} onToggle={() => setOpenMenu(openMenu === "edit" ? null : "edit")} items={[
-          { label: "撤销", shortcut: "Ctrl+Z", action: () => action(() => undo()) },
-          { label: "重做", shortcut: "Ctrl+Y", action: () => action(() => redo()) },
+          { label: "撤销", shortcut: "Ctrl+Z", action: () => action(() => useTimelineStore.getState().undo()) },
+          { label: "重做", shortcut: "Ctrl+Y", action: () => action(() => useTimelineStore.getState().redo()) },
           { type: "separator" },
           { label: "删除选中帧", shortcut: "Delete", action: () => action(() => {
             const s = useTimelineStore.getState();
@@ -112,7 +112,7 @@ export function MenuBar() {
 }
 
 function FullscreenPreview({ onClose }: { onClose: () => void }) {
-  const tracks = useTimelineStore((s) => s.tracks);
+  const document = useAnimationDocumentStore((s) => s.document);
   const currentFrame = useTimelineStore((s) => s.currentFrame);
   const setCurrentFrame = useTimelineStore((s) => s.setCurrentFrame);
   const togglePlay = useTimelineStore((s) => s.togglePlay);
@@ -120,24 +120,7 @@ function FullscreenPreview({ onClose }: { onClose: () => void }) {
   const fps = useTimelineStore((s) => s.fps);
   const totalFrames = useTimelineStore((s) => s.totalFrames);
 
-  // 查找当前帧图片
-  const currentAsset = (() => {
-    for (const track of tracks) {
-      if (!track.visible) continue;
-      if (currentFrame < track.assets.length) return track.assets[currentFrame];
-    }
-    return null;
-  })();
-
-  const [imgSrc, setImgSrc] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (currentAsset) {
-      setImgSrc(convertFileSrc(currentAsset.sourcePath));
-    } else {
-      setImgSrc(null);
-    }
-  }, [currentAsset]);
+  const animation = document?.animations[0] ?? null;
 
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
@@ -160,8 +143,13 @@ function FullscreenPreview({ onClose }: { onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-[100] bg-black flex flex-col">
       <div className="flex-1 flex items-center justify-center relative">
-        {imgSrc ? (
-          <img src={imgSrc} alt="预览" className="max-w-full max-h-full object-contain" />
+        {document && animation ? (
+          <AnimationCanvas
+            document={document}
+            animationId={animation.id}
+            tick={currentFrame}
+            className="relative h-full w-full"
+          />
         ) : (
           <div className="text-gray-600 text-lg">帧 {currentFrame} 无内容</div>
         )}

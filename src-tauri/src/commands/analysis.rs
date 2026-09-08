@@ -1,8 +1,8 @@
-use crate::ai::AiConfig;
-use crate::ai::analysis::displacement::detect_displacement_simple;
-use crate::ai::analysis::flicker::detect_flicker_simple;
 use crate::ai::analysis::cloud;
+use crate::ai::analysis::displacement::{detect_displacement_pair, load_frame_rgba};
+use crate::ai::analysis::flicker::{compute_brightness, detect_flicker_from_brightnesses};
 use crate::ai::providers::AnalysisReport;
+use crate::ai::AiConfig;
 use crate::db::DbState;
 use rusqlite::params;
 use tauri::{AppHandle, Emitter, State};
@@ -35,54 +35,89 @@ pub fn analyze_track(
 
     let total = paths.len();
 
-    // 加载图片数据
-    app.emit("analysis-progress", serde_json::json!({
-        "stage": "loading", "current": 0, "total": total
-    })).ok();
+    app.emit(
+        "analysis-progress",
+        serde_json::json!({
+            "stage": "loading", "current": 0, "total": total
+        }),
+    )
+    .ok();
 
-    let mut frames_data = Vec::new();
-    let mut widths = Vec::new();
-    let mut heights = Vec::new();
+    // ── 第 1 遍：逐帧计算亮度（仅保留 f64 序列，~8 bytes/帧）──
+    let mut brightnesses: Vec<f64> = Vec::with_capacity(total);
 
     for (i, path) in paths.iter().enumerate() {
-        let data = std::fs::read(path).map_err(|e| format!("读取帧 {} 失败: {}", i, e))?;
-        let img = image::load_from_memory(&data)
-            .map_err(|e| format!("解码帧 {} 失败: {}", i, e))?;
-        let rgba = img.to_rgba8();
-        widths.push(rgba.width());
-        heights.push(rgba.height());
-        frames_data.push(rgba.into_raw());
+        let (data, w, h) = load_frame_rgba(path)?;
+        brightnesses.push(compute_brightness(&data, w, h));
+        // data 在此处自动 drop，释放 ~W*H*4 字节
 
-        if i % 10 == 0 {
-            app.emit("analysis-progress", serde_json::json!({
-                "stage": "loading", "current": i + 1, "total": total
-            })).ok();
+        if i % 10 == 0 || i == total - 1 {
+            app.emit(
+                "analysis-progress",
+                serde_json::json!({
+                    "stage": "loading", "current": i + 1, "total": total
+                }),
+            )
+            .ok();
         }
     }
 
-    // 位移检测
-    app.emit("analysis-progress", serde_json::json!({
-        "stage": "displacement", "current": 0, "total": total
-    })).ok();
+    // ── 第 2 遍：逐对加载帧做位移检测（内存中最多 2 帧）──
+    app.emit(
+        "analysis-progress",
+        serde_json::json!({
+            "stage": "displacement", "current": 0, "total": total
+        }),
+    )
+    .ok();
 
-    let displacement = detect_displacement_simple(&frames_data, &widths, &heights);
+    let mut displacement = Vec::with_capacity(total.saturating_sub(1));
 
-    app.emit("analysis-progress", serde_json::json!({
-        "stage": "displacement", "current": total, "total": total
-    })).ok();
+    if total > 1 {
+        let (mut prev_data, mut prev_w, mut prev_h) = load_frame_rgba(&paths[0])?;
 
-    // 闪烁检测
-    app.emit("analysis-progress", serde_json::json!({
-        "stage": "flicker", "current": 0, "total": total
-    })).ok();
+        for i in 1..total {
+            let (cur_data, cur_w, cur_h) = load_frame_rgba(&paths[i])?;
+            displacement.push(detect_displacement_pair(
+                &prev_data, prev_w, prev_h, &cur_data, cur_w, cur_h, i as i64,
+            ));
+            // 释放前一帧，替换为当前帧用于下轮迭代
+            prev_data = cur_data;
+            prev_w = cur_w;
+            prev_h = cur_h;
 
-    let flicker_frames = detect_flicker_simple(&frames_data, &widths, &heights);
+            if i % 10 == 0 || i == total - 1 {
+                app.emit(
+                    "analysis-progress",
+                    serde_json::json!({
+                        "stage": "displacement", "current": i + 1, "total": total
+                    }),
+                )
+                .ok();
+            }
+        }
+    }
 
-    app.emit("analysis-progress", serde_json::json!({
-        "stage": "flicker", "current": total, "total": total
-    })).ok();
+    // ── 闪烁检测：基于已收集的亮度序列（内存占用可忽略）──
+    app.emit(
+        "analysis-progress",
+        serde_json::json!({
+            "stage": "flicker", "current": 0, "total": total
+        }),
+    )
+    .ok();
 
-    // 生成报告
+    let flicker_frames = detect_flicker_from_brightnesses(&brightnesses);
+
+    app.emit(
+        "analysis-progress",
+        serde_json::json!({
+            "stage": "flicker", "current": total, "total": total
+        }),
+    )
+    .ok();
+
+    // ── 生成报告 ──
     let report = AnalysisReport {
         id: uuid::Uuid::new_v4().to_string(),
         project_id: project_id.clone(),
@@ -112,9 +147,13 @@ pub fn analyze_track(
         ],
     ).map_err(|e| format!("保存报告失败: {}", e))?;
 
-    app.emit("analysis-progress", serde_json::json!({
-        "stage": "done", "current": total, "total": total
-    })).ok();
+    app.emit(
+        "analysis-progress",
+        serde_json::json!({
+            "stage": "done", "current": total, "total": total
+        }),
+    )
+    .ok();
 
     Ok(report)
 }
@@ -163,8 +202,11 @@ pub fn get_analysis_reports(
 #[tauri::command]
 pub fn delete_analysis_report(db: State<'_, DbState>, report_id: String) -> Result<(), String> {
     let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
-    conn.execute("DELETE FROM analysis_reports WHERE id = ?1", params![report_id])
-        .map_err(|e| format!("删除报告失败: {}", e))?;
+    conn.execute(
+        "DELETE FROM analysis_reports WHERE id = ?1",
+        params![report_id],
+    )
+    .map_err(|e| format!("删除报告失败: {}", e))?;
     Ok(())
 }
 
@@ -178,20 +220,28 @@ pub fn cloud_consistency_check(
     db: State<'_, DbState>,
 ) -> Result<AnalysisReport, String> {
     let cfg = config.lock().map_err(|e| format!("配置锁失败: {}", e))?;
-    let openai_provider = cfg.providers.iter()
+    let openai_provider = cfg
+        .providers
+        .iter()
         .find(|p| p.id == "openai")
-        .ok_or("未找到 OpenAI Provider")?.clone();
-    let api_key = cfg.api_keys.get("openai")
-        .ok_or("未配置 OpenAI API Key")?.clone();
+        .ok_or("未找到 OpenAI Provider")?
+        .clone();
+    let api_key = cfg
+        .api_keys
+        .get("openai")
+        .ok_or("未配置 OpenAI API Key")?
+        .clone();
     drop(cfg);
 
     let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
     let mut stmt = conn
         .prepare("SELECT source_path FROM assets WHERE track_id = ?1 ORDER BY start_frame")
         .map_err(|e| format!("查询资产失败: {}", e))?;
-    let paths: Vec<String> = stmt.query_map(params![track_id], |row| row.get(0))
+    let paths: Vec<String> = stmt
+        .query_map(params![track_id], |row| row.get(0))
         .map_err(|e| format!("读取路径失败: {}", e))?
-        .filter_map(|p| p.ok()).collect();
+        .filter_map(|p| p.ok())
+        .collect();
     drop(stmt);
     drop(conn);
 
@@ -199,9 +249,13 @@ pub fn cloud_consistency_check(
         return Err("轨道中没有帧".to_string());
     }
 
-    app.emit("analysis-progress", serde_json::json!({
-        "stage": "loading", "current": 0, "total": paths.len()
-    })).ok();
+    app.emit(
+        "analysis-progress",
+        serde_json::json!({
+            "stage": "loading", "current": 0, "total": paths.len()
+        }),
+    )
+    .ok();
 
     // 编码帧为 base64
     let mut frames_b64 = Vec::new();
@@ -211,19 +265,25 @@ pub fn cloud_consistency_check(
         frames_b64.push(b64);
     }
 
-    app.emit("analysis-progress", serde_json::json!({
-        "stage": "consistency", "current": 0, "total": 1
-    })).ok();
+    app.emit(
+        "analysis-progress",
+        serde_json::json!({
+            "stage": "consistency", "current": 0, "total": 1
+        }),
+    )
+    .ok();
 
     // 调用云端分析
     let consistency = cloud::check_consistency_openai(&openai_provider, &api_key, &frames_b64)?;
 
     // 生成建议
-    let issues: Vec<(i64, String, String)> = vec![
-        (0, "consistency".to_string(), consistency.description.clone()),
-    ];
-    let suggestions = cloud::generate_suggestions_openai(&openai_provider, &api_key, &issues)
-        .unwrap_or_default();
+    let issues: Vec<(i64, String, String)> = vec![(
+        0,
+        "consistency".to_string(),
+        consistency.description.clone(),
+    )];
+    let suggestions =
+        cloud::generate_suggestions_openai(&openai_provider, &api_key, &issues).unwrap_or_default();
 
     let report = AnalysisReport {
         id: uuid::Uuid::new_v4().to_string(),
@@ -248,9 +308,13 @@ pub fn cloud_consistency_check(
         ],
     ).map_err(|e| format!("保存报告失败: {}", e))?;
 
-    app.emit("analysis-progress", serde_json::json!({
-        "stage": "done", "current": 1, "total": 1
-    })).ok();
+    app.emit(
+        "analysis-progress",
+        serde_json::json!({
+            "stage": "done", "current": 1, "total": 1
+        }),
+    )
+    .ok();
 
     Ok(report)
 }

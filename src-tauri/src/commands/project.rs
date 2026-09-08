@@ -4,6 +4,24 @@ use rusqlite::params;
 use serde_json;
 use tauri::State;
 
+fn validate_project_settings(
+    name: &str,
+    canvas_width: i64,
+    canvas_height: i64,
+    fps: i64,
+) -> Result<(), String> {
+    if name.trim().is_empty() || name.chars().count() > 128 {
+        return Err("项目名称必须为 1 到 128 个字符".to_string());
+    }
+    if !(1..=16_384).contains(&canvas_width) || !(1..=16_384).contains(&canvas_height) {
+        return Err("画布尺寸必须在 1 到 16384 像素之间".to_string());
+    }
+    if !(1..=240).contains(&fps) {
+        return Err("帧率必须在 1 到 240 之间".to_string());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn create_project(
     db: State<'_, DbState>,
@@ -12,6 +30,7 @@ pub fn create_project(
     canvas_height: i64,
     fps: i64,
 ) -> Result<Project, String> {
+    validate_project_settings(&name, canvas_width, canvas_height, fps)?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -105,6 +124,7 @@ pub fn update_project(
     canvas_height: i64,
     fps: i64,
 ) -> Result<(), String> {
+    validate_project_settings(&name, canvas_width, canvas_height, fps)?;
     let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
@@ -122,17 +142,21 @@ pub fn update_baseline_points(
     points_json: String,
 ) -> Result<(), String> {
     let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
-    conn.execute("DELETE FROM baseline_points WHERE project_id = ?1", params![project_id])
-        .map_err(|e| format!("删除旧基准点失败: {}", e))?;
+    conn.execute(
+        "DELETE FROM baseline_points WHERE project_id = ?1",
+        params![project_id],
+    )
+    .map_err(|e| format!("删除旧基准点失败: {}", e))?;
 
-    let points: Vec<serde_json::Value> = serde_json::from_str(&points_json)
-        .map_err(|e| format!("解析基准点失败: {}", e))?;
+    let points: Vec<serde_json::Value> =
+        serde_json::from_str(&points_json).map_err(|e| format!("解析基准点失败: {}", e))?;
 
     for p in points {
         let id = p["id"].as_str().unwrap_or("").to_string();
         let name = p["name"].as_str().unwrap_or("").to_string();
         let pt_type = p["type"].as_str().unwrap_or("point").to_string();
-        let coords = p["coordinates"].as_array()
+        let coords = p["coordinates"]
+            .as_array()
             .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect::<Vec<_>>())
             .unwrap_or_default();
         let coords_str = serde_json::to_string(&coords).unwrap_or("[]".to_string());
@@ -154,21 +178,23 @@ pub fn get_baseline_points(
     let mut stmt = conn
         .prepare("SELECT id, name, type, coordinates, frame_index FROM baseline_points WHERE project_id = ?1")
         .map_err(|e| format!("查询基准点失败: {}", e))?;
-    let points = stmt.query_map(params![project_id], |row| {
-        let id: String = row.get(0)?;
-        let name: String = row.get(1)?;
-        let pt_type: String = row.get(2)?;
-        let coords_str: String = row.get(3)?;
-        let frame_index: i64 = row.get(4)?;
-        Ok(serde_json::json!({
-            "id": id,
-            "name": name,
-            "type": pt_type,
-            "coordinates": serde_json::from_str::<Vec<f64>>(&coords_str).unwrap_or_default(),
-            "frameIndex": frame_index,
-        }))
-    }).map_err(|e| format!("读取基准点失败: {}", e))?
-    .filter_map(|p| p.ok())
-    .collect();
+    let points = stmt
+        .query_map(params![project_id], |row| {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let pt_type: String = row.get(2)?;
+            let coords_str: String = row.get(3)?;
+            let frame_index: i64 = row.get(4)?;
+            Ok(serde_json::json!({
+                "id": id,
+                "name": name,
+                "type": pt_type,
+                "coordinates": serde_json::from_str::<Vec<f64>>(&coords_str).unwrap_or_default(),
+                "frameIndex": frame_index,
+            }))
+        })
+        .map_err(|e| format!("读取基准点失败: {}", e))?
+        .filter_map(|p| p.ok())
+        .collect();
     Ok(points)
 }

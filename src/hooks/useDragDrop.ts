@@ -2,17 +2,15 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore } from "../stores/projectStore";
 import { useTimelineStore } from "../stores/timelineStore";
-import type { Track } from "../types/timeline";
-import type { Asset } from "../types/asset";
+import { useAnimationDocumentStore } from "../stores/animationDocumentStore";
+import { projectSessionController } from "../core/projectSession";
+import { importTrackForSession } from "../core/projectImport";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "bmp"];
 
 export function useDragDrop() {
   const [isDragging, setIsDragging] = useState(false);
-  const project = useProjectStore((s) => s.project);
-  const addTrack = useTimelineStore((s) => s.addTrack);
-  const addAssetToTrack = useTimelineStore((s) => s.addAssetToTrack);
-  const tracks = useTimelineStore((s) => s.tracks);
+  const sessionId = useProjectStore((s) => s.sessionId);
 
   useEffect(() => {
     const handleDragOver = (e: DragEvent) => {
@@ -32,7 +30,9 @@ export function useDragDrop() {
       e.stopPropagation();
       setIsDragging(false);
 
-      if (!project) return;
+      const project = useProjectStore.getState().project;
+      const token = projectSessionController.snapshot();
+      if (!project || !token || !projectSessionController.isCurrent(token, true)) return;
 
       // Tauri 拖拽文件的处理
       const files = e.dataTransfer?.files;
@@ -54,23 +54,41 @@ export function useDragDrop() {
       if (imageFiles.length === 0) return;
 
       try {
-        const track = await invoke<Track>("create_track", {
-          projectId: project.id,
-          name: `导入帧 ${tracks.length + 1}`,
-          trackType: "image_sequence",
-        });
+        const currentFps = useTimelineStore.getState().fps;
+        const trackCount = useTimelineStore.getState().tracks.length;
 
-        addTrack(track);
-
-        const assets = await invoke<Asset[]>("import_frames_to_track", {
-          trackId: track.id,
-          filePaths: imageFiles,
-          startFrame: 0,
-        });
-
-        for (const asset of assets) {
-          addAssetToTrack(track.id, asset);
-        }
+        await importTrackForSession(
+          token,
+          {
+            operationId: crypto.randomUUID(),
+            projectId: project.id,
+            name: `导入帧 ${trackCount + 1}`,
+            filePaths: imageFiles,
+            fps: currentFps,
+          },
+          {
+            isCurrent: (candidate, requireReady) =>
+              projectSessionController.isCurrent(candidate, requireReady),
+            importTrack: (input) =>
+              invoke("import_files_to_new_track", {
+                ...input,
+                trackType: "image_sequence",
+                startFrame: 0,
+                sourceFps: 0,
+              }),
+            acceptTrack: (track) => {
+              const activeProject = useProjectStore.getState().project;
+              if (!activeProject || activeProject.id !== project.id) return;
+              const tracks = [...useTimelineStore.getState().tracks, track];
+              useTimelineStore.getState().setTracks(tracks);
+              useAnimationDocumentStore
+                .getState()
+                .replaceFromLegacy(activeProject, tracks);
+            },
+            log: (message, details) =>
+              console.info(`[FrameForge] ${message}`, details),
+          },
+        );
       } catch (err) {
         console.error("拖拽导入失败:", err);
       }
@@ -85,7 +103,7 @@ export function useDragDrop() {
       document.removeEventListener("dragleave", handleDragLeave);
       document.removeEventListener("drop", handleDrop);
     };
-  }, [project, tracks.length, addTrack, addAssetToTrack]);
+  }, [sessionId]);
 
   return isDragging;
 }

@@ -1,8 +1,14 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useProjectStore } from "../../stores/projectStore";
 import { useTimelineStore } from "../../stores/timelineStore";
+import { AnimationCanvasRenderer } from "../../engines/animationCanvasRenderer";
+import { useAnimationDocumentStore } from "../../stores/animationDocumentStore";
+import {
+  chooseExportDestination,
+  getAnimationExportTiming,
+} from "../../core/exportWorkflow";
 
 type ExportFormat = "png_sequence" | "gif" | "mp4";
 
@@ -13,50 +19,61 @@ interface Props {
 export function ExportDialog({ onClose }: Props) {
   const project = useProjectStore((s) => s.project);
   const tracks = useTimelineStore((s) => s.tracks);
-  const fps = useTimelineStore((s) => s.fps);
-  const totalFrames = useTimelineStore((s) => s.totalFrames);
+  const document = useAnimationDocumentStore((s) => s.document);
   const [format, setFormat] = useState<ExportFormat>("png_sequence");
   const [exporting, setExporting] = useState(false);
   const [result, setResult] = useState<string | null>(null);
+  const animation = document?.animations[0];
+  const timing = document && animation ? getAnimationExportTiming(document) : null;
 
   const handleExport = async () => {
     if (!project) return;
+    if (!document || !animation) {
+      setResult("导出失败: 动画文档尚未就绪");
+      return;
+    }
 
-    if (format === "png_sequence") {
-      const selected = await openDialog({ directory: true, title: "选择导出目录" });
+    try {
+      const selected =
+        format === "mp4"
+          ? null
+          : await chooseExportDestination(
+              format,
+              project.name,
+              openDialog,
+              saveDialog,
+            );
       if (!selected) return;
       setExporting(true);
-      try {
-        const count = await invoke<number>("export_png_sequence", {
-          projectId: project.id,
+      setResult(null);
+      if (format === "png_sequence") {
+        const frames = await new AnimationCanvasRenderer().renderPngFrames(
+          document,
+          animation.id,
+        );
+        const count = await invoke<number>("write_rendered_png_sequence", {
+          operationId: crypto.randomUUID(),
           outputDir: selected,
+          frames,
         });
         setResult(`成功导出 ${count} 帧到:\n${selected}`);
-      } catch (err) {
-        setResult(`导出失败: ${err}`);
-      } finally {
-        setExporting(false);
-      }
-    } else if (format === "gif") {
-      const selected = await openDialog({
-        save: true,
-        title: "保存 GIF 文件",
-        filters: [{ name: "GIF", extensions: ["gif"] }],
-      });
-      if (!selected) return;
-      setExporting(true);
-      try {
-        const count = await invoke<number>("export_gif", {
-          projectId: project.id,
+      } else if (format === "gif") {
+        const frames = await new AnimationCanvasRenderer().renderPngFrames(
+          document,
+          animation.id,
+        );
+        const count = await invoke<number>("write_rendered_gif", {
+          operationId: crypto.randomUUID(),
           outputPath: selected,
-          fps,
+          frameDelayMs: timing?.frameDelayMs ?? 1,
+          frames,
         });
         setResult(`成功导出 GIF（${count} 帧）到:\n${selected}`);
-      } catch (err) {
-        setResult(`导出失败: ${err}`);
-      } finally {
-        setExporting(false);
       }
+    } catch (err) {
+      setResult(`导出失败: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setExporting(false);
     }
   };
 
@@ -73,7 +90,7 @@ export function ExportDialog({ onClose }: Props) {
 
         <div className="space-y-3 mb-4">
           <div className="text-xs text-gray-500">
-            项目: {project?.name} | {totalFrames} 帧 | {fps} fps | {tracks.length} 轨道
+            项目: {project?.name} | {timing?.totalFrames ?? 0} 帧 | {timing?.fps ?? 0} fps | {tracks.length} 图层
           </div>
 
           {formats.map((f) => (

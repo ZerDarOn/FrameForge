@@ -1,7 +1,7 @@
+mod ai;
 mod commands;
 mod db;
 mod models;
-mod ai;
 
 use db::DbState;
 use tauri::Manager;
@@ -20,10 +20,7 @@ pub fn run() {
                 )?;
             }
 
-            let app_dir = app
-                .path()
-                .app_data_dir()
-                .expect("无法获取应用数据目录");
+            let app_dir = app.path().app_data_dir().expect("无法获取应用数据目录");
             std::fs::create_dir_all(&app_dir).ok();
             let conn = db::init_db(&app_dir).expect("数据库初始化失败");
             app.manage(DbState::new(conn));
@@ -39,8 +36,14 @@ pub fn run() {
             commands::project::update_project,
             commands::project::update_baseline_points,
             commands::project::get_baseline_points,
+            commands::animation_document::get_animation_document,
+            commands::animation_document::save_animation_document,
+            commands::animation_document::read_content_image,
+            commands::animation_document::write_content_revision,
             commands::asset::scan_image_folder,
             commands::asset::create_track,
+            commands::asset::import_files_to_new_track,
+            commands::asset::extract_asset_to_new_track,
             commands::asset::import_frames_to_track,
             commands::asset::get_project_tracks,
             commands::asset::read_image_as_base64,
@@ -50,6 +53,8 @@ pub fn run() {
             commands::asset::update_asset_transform,
             commands::asset::export_png_sequence,
             commands::asset::export_gif,
+            commands::rendered_export::write_rendered_png_sequence,
+            commands::rendered_export::write_rendered_gif,
             commands::ai_config::get_ai_config,
             commands::ai_config::set_ai_api_key,
             commands::ai_config::toggle_ai_provider,

@@ -17,35 +17,61 @@ export function Timeline() {
   const addTrack = useTimelineStore((s) => s.addTrack);
   const project = useProjectStore((s) => s.project);
   const timerRef = useRef<number | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const lastFrameTimeRef = useRef(0);
   const frameRef = useRef(currentFrame);
   const totalRef = useRef(totalFrames);
+  const fpsRef = useRef(fps);
   const rulerScrollRef = useRef<HTMLDivElement>(null);
 
   frameRef.current = currentFrame;
   totalRef.current = totalFrames;
+  fpsRef.current = fps;
 
-  // 播放定时器
+  // 播放驱动：基于 requestAnimationFrame 的精确时间步进，无漂移
   useEffect(() => {
-    if (isPlaying && totalFrames > 0) {
-      const interval = 1000 / fps;
-      timerRef.current = window.setInterval(() => {
-        const next = frameRef.current + 1;
-        if (next >= totalRef.current) {
-          setCurrentFrame(0);
-        } else {
-          setCurrentFrame(next);
-        }
-      }, interval);
-    } else {
+    if (!isPlaying || totalFrames <= 0) return;
+
+    lastFrameTimeRef.current = performance.now();
+    let frameAccumulator = 0;
+
+    const tick = (now: number) => {
+      const elapsed = now - lastFrameTimeRef.current;
+      lastFrameTimeRef.current = now;
+
+      const frameInterval = 1000 / fpsRef.current;
+      frameAccumulator += elapsed;
+
+      if (frameAccumulator >= frameInterval) {
+        const framesToAdvance = Math.floor(frameAccumulator / frameInterval);
+        frameAccumulator -= framesToAdvance * frameInterval;
+
+        const next = (frameRef.current + framesToAdvance) % Math.max(1, totalRef.current);
+        setCurrentFrame(next);
+      }
+
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [isPlaying, totalFrames, setCurrentFrame]);
+
+  // 同步清理旧 timerRef（如果还有）
+  useEffect(() => {
+    return () => {
       if (timerRef.current) {
         clearInterval(timerRef.current);
         timerRef.current = null;
       }
-    }
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [isPlaying, fps, totalFrames, setCurrentFrame]);
+  }, []);
 
   // 播放头自动滚动跟随
   useEffect(() => {

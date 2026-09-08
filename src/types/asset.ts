@@ -33,4 +33,6 @@ export interface Asset {
   matchedFps: boolean;
   /** 原始时间戳（毫秒），用于视频帧定位 */
   sourceTimestamp?: number;
+  /** Stable document cel identity used by the legacy timeline adapter. */
+  documentCelId?: string;
 }

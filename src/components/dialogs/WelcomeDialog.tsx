@@ -51,7 +51,7 @@ export function WelcomeDialog({ onProjectCreated }: Props) {
     <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-50">
       <div className="bg-gray-900 rounded-lg border border-gray-700 p-8 w-[480px] shadow-2xl">
         <h1 className="text-2xl font-bold text-orange-400 mb-2">FrameForge</h1>
-        <p className="text-gray-400 text-sm mb-6">AI动画帧审查工具</p>
+        <p className="text-gray-400 text-sm mb-6">像素帧动画编辑器与 AI 辅助审查工具</p>
 
         <div className="space-y-3">
           <button

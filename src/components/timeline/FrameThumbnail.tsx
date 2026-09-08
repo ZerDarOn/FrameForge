@@ -7,14 +7,18 @@ interface Props {
   asset: Asset;
   isSelected: boolean;
   isCurrentFrame: boolean;
-  onClick: () => void;
+  onClick: (event: React.MouseEvent<HTMLDivElement>) => void;
   onContextMenu?: (e: React.MouseEvent) => void;
   width?: number;
   height?: number;
+  draggable?: boolean;
+  onDragStart?: (e: React.DragEvent) => void;
+  onDragEnd?: () => void;
 }
 
 export const FrameThumbnail = memo(function FrameThumbnail({
   asset, isSelected, isCurrentFrame, onClick, onContextMenu, width = 60, height = 40,
+  draggable: isDraggable, onDragStart, onDragEnd,
 }: Props) {
   const quality = useUIStore((s) => s.thumbnailQuality);
   const { thumbnail } = useThumbnail(asset.sourcePath, quality);
@@ -33,6 +37,9 @@ export const FrameThumbnail = memo(function FrameThumbnail({
       style={{ width, height }}
       onClick={onClick}
       onContextMenu={onContextMenu}
+      draggable={isDraggable}
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
       title={asset.matchedFps ? asset.name : `${asset.name} (不匹配帧率)`}
     >
       {thumbnail ? (

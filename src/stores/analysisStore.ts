@@ -10,6 +10,7 @@ interface AnalysisState {
 
   setReports: (reports: AnalysisReport[]) => void;
   setActiveReport: (id: string | null) => void;
+  setProgress: (progress: { stage: string; current: number; total: number } | null) => void;
   loadReports: (projectId: string) => Promise<void>;
   analyzeTrack: (projectId: string, trackId: string) => Promise<void>;
   deleteReport: (reportId: string) => Promise<void>;
@@ -23,6 +24,7 @@ export const useAnalysisStore = create<AnalysisState>((set) => ({
 
   setReports: (reports) => set({ reports }),
   setActiveReport: (id) => set({ activeReportId: id }),
+  setProgress: (progress) => set({ progress }),
 
   loadReports: async (projectId) => {
     try {

@@ -3,6 +3,14 @@ import type { PixelImage, RgbaColor } from "../types/pixelImage.ts";
 const MAX_PALETTE_COLORS = 64;
 const MAX_REDUCED_PALETTE_COLORS = 32;
 const MAX_TRACKED_UNIQUE_COLORS = 65_536;
+const MAX_DITHER_STRENGTH = 64;
+const BAYER_MATRIX_SIZE = 4;
+const BAYER_MATRIX = [
+  0, 8, 2, 10,
+  12, 4, 14, 6,
+  3, 11, 1, 9,
+  15, 7, 13, 5,
+] as const;
 
 export interface PixelPaletteEntry {
   color: RgbaColor;
@@ -30,6 +38,10 @@ export interface SharedPaletteReductionResult {
   changedPixels: number[];
   totalChangedPixels: number;
   palette: RgbaColor[];
+}
+
+export interface PixelPaletteApplicationOptions {
+  ditherStrength?: number;
 }
 
 interface ColorSample {
@@ -79,6 +91,22 @@ function colorFromKey(key: number): RgbaColor {
 
 function rgbKey(red: number, green: number, blue: number) {
   return (red << 16) | (green << 8) | blue;
+}
+
+function assertDitherStrength(ditherStrength: number) {
+  if (
+    !Number.isInteger(ditherStrength) ||
+    ditherStrength < 0 ||
+    ditherStrength > MAX_DITHER_STRENGTH
+  ) {
+    throw new Error(
+      `ditherStrength must be an integer between 0 and ${MAX_DITHER_STRENGTH}`,
+    );
+  }
+}
+
+function clampColorChannel(channel: number) {
+  return Math.max(0, Math.min(255, channel));
 }
 
 function sampleChannel(sample: ColorSample, channel: 0 | 1 | 2) {
@@ -307,12 +335,15 @@ function createPalettePlan(images: PixelImage[], maxColors: number) {
 export function applyPixelPalette(
   image: PixelImage,
   palette: RgbaColor[],
+  options: PixelPaletteApplicationOptions = {},
 ) {
   assertPixelImage(image);
   if (palette.length < 1 || palette.length > MAX_REDUCED_PALETTE_COLORS) {
     throw new Error(`palette must contain between 1 and ${MAX_REDUCED_PALETTE_COLORS} colors`);
   }
   palette.forEach(assertColor);
+  const ditherStrength = options.ditherStrength ?? 0;
+  assertDitherStrength(ditherStrength);
   const paletteByExactRgb = new Map(
     palette.map((color) => [rgbKey(color[0], color[1], color[2]), color]),
   );
@@ -326,11 +357,21 @@ export function applyPixelPalette(
     const blue = data[index + 2];
     const exactKey = rgbKey(red, green, blue);
     const key = ((red >> 3) << 10) | ((green >> 3) << 5) | (blue >> 3);
-    let closest = paletteByExactRgb.get(exactKey) ?? paletteByBucket.get(key);
+    const pixelIndex = index / 4;
+    const x = pixelIndex % image.width;
+    const y = Math.floor(pixelIndex / image.width);
+    const ditherPhase =
+      (y % BAYER_MATRIX_SIZE) * BAYER_MATRIX_SIZE + (x % BAYER_MATRIX_SIZE);
+    const cacheKey = ditherStrength > 0 ? (ditherPhase << 15) | key : key;
+    let closest = paletteByExactRgb.get(exactKey) ?? paletteByBucket.get(cacheKey);
     if (!closest) {
-      const bucketRed = ((key >>> 10) & 0x1f) * 8 + 3.5;
-      const bucketGreen = ((key >>> 5) & 0x1f) * 8 + 3.5;
-      const bucketBlue = (key & 0x1f) * 8 + 3.5;
+      const ditherOffset =
+        ditherStrength > 0
+          ? ((BAYER_MATRIX[ditherPhase] - 7.5) / 16) * ditherStrength
+          : 0;
+      const bucketRed = clampColorChannel(((key >>> 10) & 0x1f) * 8 + 3.5 + ditherOffset);
+      const bucketGreen = clampColorChannel(((key >>> 5) & 0x1f) * 8 + 3.5 + ditherOffset);
+      const bucketBlue = clampColorChannel((key & 0x1f) * 8 + 3.5 + ditherOffset);
       let closestDistance = Number.POSITIVE_INFINITY;
       for (const candidate of palette) {
         const distance =
@@ -343,7 +384,7 @@ export function applyPixelPalette(
         }
       }
       if (!closest) throw new Error("Palette is empty");
-      paletteByBucket.set(key, closest);
+      paletteByBucket.set(cacheKey, closest);
     }
     if (red !== closest[0] || green !== closest[1] || blue !== closest[2]) {
       data[index] = closest[0];
@@ -362,10 +403,12 @@ export function applyPixelPalette(
 export function reducePixelImagesPalette(
   images: PixelImage[],
   maxColors: number,
+  options: PixelPaletteApplicationOptions = {},
 ): SharedPaletteReductionResult {
   if (images.length === 0) throw new Error("at least one image is required");
   assertReducedPaletteSize(maxColors);
   images.forEach(assertPixelImage);
+  assertDitherStrength(options.ditherStrength ?? 0);
   const plan = createPalettePlan(images, maxColors);
   if (!plan.requiresReduction) {
     return {
@@ -375,7 +418,7 @@ export function reducePixelImagesPalette(
       palette: plan.palette,
     };
   }
-  const reduced = images.map((image) => applyPixelPalette(image, plan.palette));
+  const reduced = images.map((image) => applyPixelPalette(image, plan.palette, options));
   const changedPixels = reduced.map((result) => result.changedPixels);
   return {
     images: reduced.map((result) => result.image),
@@ -388,8 +431,9 @@ export function reducePixelImagesPalette(
 export function reducePixelPalette(
   image: PixelImage,
   maxColors: number,
+  options: PixelPaletteApplicationOptions = {},
 ): PaletteReductionResult {
-  const reduced = reducePixelImagesPalette([image], maxColors);
+  const reduced = reducePixelImagesPalette([image], maxColors, options);
   return {
     image: reduced.images[0],
     changedPixels: reduced.changedPixels[0],

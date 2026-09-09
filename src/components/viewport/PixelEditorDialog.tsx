@@ -37,6 +37,7 @@ type CleanupPreview = TransparencyCleanupResult | PaletteReductionResult;
 const MAX_EDITABLE_PIXELS = 4 * 1024 * 1024;
 const MAX_BATCH_CLEANUP_CELS = 64;
 const MAX_BATCH_PALETTE_PIXELS = 8 * 1024 * 1024;
+const MAX_PALETTE_DITHER_STRENGTH = 64;
 const PIXEL_TOOL_LABELS: Record<PixelTool, string> = {
   pencil: "铅笔",
   eraser: "橡皮",
@@ -138,6 +139,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
   const [cleanupColor, setCleanupColor] = useState("#000000");
   const [cleanupTolerance, setCleanupTolerance] = useState(0);
   const [paletteSize, setPaletteSize] = useState(16);
+  const [paletteDitherStrength, setPaletteDitherStrength] = useState(0);
   const [paletteAnalysis, setPaletteAnalysis] = useState<PixelPaletteAnalysis | null>(null);
   const [cleanupPreview, setCleanupPreview] = useState<CleanupPreview | null>(null);
   const [showCleanupPreview, setShowCleanupPreview] = useState(true);
@@ -171,6 +173,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     ? [
         documentState.projectId,
         paletteSize,
+        paletteDitherStrength,
         ...cleanupSelectionCels
           .map((candidate) => `${candidate.id}:${candidate.contentRevisionId}`)
           .sort(),
@@ -297,6 +300,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       setCleanupColor(analysis.colors[0] ? colorToHex(analysis.colors[0].color) : "#000000");
       setCleanupTolerance(0);
       setPaletteSize(Math.max(2, Math.min(16, analysis.uniqueColorCount ?? 16)));
+      setPaletteDitherStrength(0);
       setCleanupMode("transparency");
       setApplyToSelection(false);
       setBatchProgress(null);
@@ -336,6 +340,12 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     setBatchPalettePreviewSignature(null);
   };
 
+  const handlePaletteDitherStrengthChange = (value: number) => {
+    setPaletteDitherStrength(value);
+    setCleanupPreview(null);
+    setBatchPalettePreviewSignature(null);
+  };
+
   const handleApplyToSelectionChange = (checked: boolean) => {
     setApplyToSelection(checked);
     setCleanupPreview(null);
@@ -361,6 +371,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       const previewSignature = [
         sourceDocument.projectId,
         paletteSize,
+        paletteDitherStrength,
         ...targetCels
           .map((candidate) => `${candidate.id}:${candidate.contentRevisionId}`)
           .sort(),
@@ -394,6 +405,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
         targetCelCount: targetCels.length,
         uniqueContentCount: uniqueContents.size,
         paletteSize,
+        ditherStrength: paletteDitherStrength,
       });
       setBusy(true);
       setError(null);
@@ -418,7 +430,9 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
           images.push(sourceImage);
           setBatchProgress({ completed: index + 1, total: orderedContents.length });
         }
-        const reduced = reducePixelImagesPalette(images, paletteSize);
+        const reduced = reducePixelImagesPalette(images, paletteSize, {
+          ditherStrength: paletteDitherStrength,
+        });
         const latestDocument = useAnimationDocumentStore.getState().document;
         const latestAnimation = latestDocument?.animations.find(
           (candidate) => candidate.id === sourceAnimation.id,
@@ -430,6 +444,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
           ? [
               latestDocument.projectId,
               paletteSize,
+              paletteDitherStrength,
               ...latestTargetCels
                 .filter((candidate) => candidate !== undefined)
                 .map((candidate) => `${candidate.id}:${candidate.contentRevisionId}`)
@@ -473,7 +488,9 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       setCleanupPreview(
         cleanupMode === "transparency"
           ? removeColorAsTransparency(current, colorFromHex(cleanupColor), cleanupTolerance)
-          : reducePixelPalette(current, paletteSize),
+          : reducePixelPalette(current, paletteSize, {
+              ditherStrength: paletteDitherStrength,
+            }),
       );
       setShowCleanupPreview(true);
       setBatchPalettePreviewSignature(null);
@@ -509,6 +526,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     const sourceBatchPaletteSignature = [
       sourceDocument.projectId,
       paletteSize,
+      paletteDitherStrength,
       ...targetCels
         .map((candidate) => `${candidate.id}:${candidate.contentRevisionId}`)
         .sort(),
@@ -570,6 +588,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       uniqueContentCount: uniqueContents.size,
       mode: cleanupMode,
       parameter: cleanupMode === "transparency" ? cleanupTolerance : paletteSize,
+      ditherStrength: cleanupMode === "palette" ? paletteDitherStrength : undefined,
     };
     console.info("[FrameForge] batch pixel cleanup started", logContext);
     commitInFlightRef.current = true;
@@ -600,7 +619,9 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
         const cleaned =
           cleanupMode === "transparency"
             ? removeColorAsTransparency(sourceImage, targetColor, cleanupTolerance)
-            : applyPixelPalette(sourceImage, sharedPalette ?? []);
+            : applyPixelPalette(sourceImage, sharedPalette ?? [], {
+                ditherStrength: paletteDitherStrength,
+              });
         if (cleaned.changedPixels > 0) {
           const revisionId = crypto.randomUUID();
           const written = await invoke<WrittenContentRevision>("write_content_revision", {
@@ -716,6 +737,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
       changedPixelCount: cleanupPreview.changedPixels,
       mode: cleanupMode,
       parameter: cleanupMode === "transparency" ? cleanupTolerance : paletteSize,
+      ditherStrength: cleanupMode === "palette" ? paletteDitherStrength : undefined,
     };
     console.info("[FrameForge] pixel cleanup started", logContext);
     updateImage(cleanupPreview.image);
@@ -1183,6 +1205,30 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                   className="w-full accent-orange-500"
                   disabled={busy}
                 />
+              </label>
+
+              <label className="mb-3 block text-xs text-gray-400">
+                <span className="mb-1 flex justify-between">
+                  <span>有序抖动</span>
+                  <span>
+                    {paletteDitherStrength === 0 ? "关闭" : paletteDitherStrength}
+                  </span>
+                </span>
+                <input
+                  type="range"
+                  min="0"
+                  max={MAX_PALETTE_DITHER_STRENGTH}
+                  step="4"
+                  value={paletteDitherStrength}
+                  onChange={(event) =>
+                    handlePaletteDitherStrengthChange(Number(event.target.value))
+                  }
+                  className="w-full accent-orange-500"
+                  disabled={busy}
+                />
+                <span className="mt-1 block text-[11px] leading-4 text-gray-500">
+                  使用固定 4×4 图案缓解色带；关闭时保持原有压色结果。
+                </span>
               </label>
 
               {cleanupSelectionCels.length > 1 && (

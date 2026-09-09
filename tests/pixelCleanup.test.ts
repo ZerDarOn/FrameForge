@@ -7,7 +7,7 @@ import {
   reducePixelPalette,
   removeColorAsTransparency,
 } from "../src/core/pixelCleanup.ts";
-import type { PixelImage } from "../src/types/pixelImage.ts";
+import type { PixelImage, RgbaColor } from "../src/types/pixelImage.ts";
 
 function image(width: number, height: number, pixels: number[]): PixelImage {
   return { width, height, data: new Uint8ClampedArray(pixels) };
@@ -151,4 +151,74 @@ test("applying a fixed palette preserves exact colors that share one RGB bucket"
 
   assert.equal(result.image, source);
   assert.equal(result.changedPixels, 0);
+});
+
+test("ordered palette dithering is deterministic and preserves alpha", () => {
+  const source = image(4, 2, [
+    128, 128, 128, 255,
+    128, 128, 128, 128,
+    9, 8, 7, 0,
+    128, 128, 128, 64,
+    128, 128, 128, 32,
+    128, 128, 128, 255,
+    128, 128, 128, 128,
+    128, 128, 128, 64,
+  ]);
+  const palette = [
+    [0, 0, 0, 255],
+    [255, 255, 255, 255],
+  ] satisfies RgbaColor[];
+
+  const result = applyPixelPalette(source, palette, { ditherStrength: 64 });
+
+  assert.equal(result.changedPixels, 7);
+  assert.deepEqual([...result.image.data], [
+    0, 0, 0, 255,
+    255, 255, 255, 128,
+    9, 8, 7, 0,
+    255, 255, 255, 64,
+    255, 255, 255, 32,
+    0, 0, 0, 255,
+    255, 255, 255, 128,
+    0, 0, 0, 64,
+  ]);
+  assert.deepEqual([...source.data], [
+    128, 128, 128, 255,
+    128, 128, 128, 128,
+    9, 8, 7, 0,
+    128, 128, 128, 64,
+    128, 128, 128, 32,
+    128, 128, 128, 255,
+    128, 128, 128, 128,
+    128, 128, 128, 64,
+  ]);
+});
+
+test("palette dithering defaults off and validates its strength", () => {
+  const source = image(1, 1, [128, 128, 128, 200]);
+  const palette = [
+    [0, 0, 0, 255],
+    [255, 255, 255, 255],
+  ] satisfies RgbaColor[];
+
+  assert.deepEqual(
+    [...applyPixelPalette(source, palette).image.data],
+    [...applyPixelPalette(source, palette, { ditherStrength: 0 }).image.data],
+  );
+  assert.throws(
+    () => applyPixelPalette(source, palette, { ditherStrength: -1 }),
+    /ditherStrength/,
+  );
+  assert.throws(
+    () => applyPixelPalette(source, palette, { ditherStrength: 65 }),
+    /ditherStrength/,
+  );
+  assert.throws(
+    () => applyPixelPalette(source, palette, { ditherStrength: 1.5 }),
+    /ditherStrength/,
+  );
+  assert.throws(
+    () => reducePixelPalette(source, 2, { ditherStrength: 65 }),
+    /ditherStrength/,
+  );
 });

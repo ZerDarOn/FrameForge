@@ -615,9 +615,11 @@ function AiAnalysisTab() {
   const setActiveReport = useAnalysisStore((s) => s.setActiveReport);
   const isAnalyzing = useAnalysisStore((s) => s.isAnalyzing);
   const progress = useAnalysisStore((s) => s.progress);
+  const analysisError = useAnalysisStore((s) => s.error);
   const tracks = useTimelineStore((s) => s.tracks);
   const project = useProjectStore((s) => s.project);
   const analyzeTrack = useAnalysisStore((s) => s.analyzeTrack);
+  const analyzeCloudTrack = useAnalysisStore((s) => s.analyzeCloudTrack);
   const currentFrame = useTimelineStore((s) => s.currentFrame);
   const setCurrentFrame = useTimelineStore((s) => s.setCurrentFrame);
 
@@ -636,7 +638,7 @@ function AiAnalysisTab() {
               <button
                 key={track.id}
                 className="w-full text-left px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded text-xs text-gray-300 disabled:opacity-50"
-                onClick={() => analyzeTrack(project.id, track.id)}
+                onClick={() => void analyzeTrack(project.id, track.id)}
                 disabled={isAnalyzing}
               >
                 {isAnalyzing ? "分析中..." : `本地分析: ${track.name}`}
@@ -645,26 +647,11 @@ function AiAnalysisTab() {
             <button
               className="w-full text-left px-3 py-2 bg-blue-900/30 hover:bg-blue-900/50 rounded text-xs text-blue-300 disabled:opacity-50"
               disabled={isAnalyzing}
-              onClick={async () => {
+              onClick={() => {
                 if (!project) return;
                 const track = tracks[0];
                 if (!track) return;
-                useAnalysisStore.setState({ isAnalyzing: true, progress: null });
-                try {
-                  const { invoke } = await import("@tauri-apps/api/core");
-                  const report = await invoke("cloud_consistency_check", {
-                    projectId: project.id, trackId: track.id,
-                  });
-                  useAnalysisStore.setState((s) => ({
-                    reports: [report as any, ...s.reports],
-                    activeReportId: (report as any).id,
-                    isAnalyzing: false,
-                    progress: null,
-                  }));
-                } catch (err) {
-                  console.error("云端分析失败:", err);
-                  useAnalysisStore.setState({ isAnalyzing: false, progress: null });
-                }
+                void analyzeCloudTrack(project.id, track.id);
               }}
             >
               云端一致性检查 (OpenAI)
@@ -675,12 +662,19 @@ function AiAnalysisTab() {
         )}
       </div>
 
+      {analysisError && (
+        <div className="rounded border border-red-800/60 bg-red-950/40 px-2 py-2 text-[10px] text-red-300">
+          分析失败：{analysisError}
+        </div>
+      )}
+
       {isAnalyzing && progress && (
         <div>
           <div className="text-[10px] text-gray-500 mb-1">
             {progress.stage === "loading" && "加载帧数据..."}
             {progress.stage === "displacement" && "位移检测..."}
             {progress.stage === "flicker" && "闪烁检测..."}
+            {progress.stage === "consistency" && "一致性检查..."}
             {progress.stage === "done" && "分析完成"}
           </div>
           <div className="w-full bg-gray-800 rounded-full h-1.5">

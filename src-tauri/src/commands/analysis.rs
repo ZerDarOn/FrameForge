@@ -4,8 +4,32 @@ use crate::ai::analysis::flicker::{compute_brightness, detect_flicker_from_brigh
 use crate::ai::providers::AnalysisReport;
 use crate::ai::AiConfig;
 use crate::db::DbState;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use tauri::{AppHandle, Emitter, State};
+
+fn load_track_paths(
+    conn: &Connection,
+    project_id: &str,
+    track_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT assets.source_path
+             FROM assets
+             INNER JOIN tracks ON tracks.id = assets.track_id
+             WHERE assets.track_id = ?1 AND tracks.project_id = ?2
+             ORDER BY assets.start_frame",
+        )
+        .map_err(|e| format!("查询资产失败: {}", e))?;
+    let rows = stmt
+        .query_map(params![track_id, project_id], |row| row.get(0))
+        .map_err(|e| format!("读取路径失败: {}", e))?;
+    let mut paths = Vec::new();
+    for row in rows {
+        paths.push(row.map_err(|e| format!("读取资产路径行失败: {}", e))?);
+    }
+    Ok(paths)
+}
 
 #[tauri::command]
 pub fn analyze_track(
@@ -17,16 +41,7 @@ pub fn analyze_track(
 ) -> Result<AnalysisReport, String> {
     let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
 
-    let mut stmt = conn
-        .prepare("SELECT source_path FROM assets WHERE track_id = ?1 ORDER BY start_frame")
-        .map_err(|e| format!("查询资产失败: {}", e))?;
-
-    let paths: Vec<String> = stmt
-        .query_map(params![track_id], |row| row.get(0))
-        .map_err(|e| format!("读取路径失败: {}", e))?
-        .filter_map(|p| p.ok())
-        .collect();
-    drop(stmt);
+    let paths = load_track_paths(&conn, &project_id, &track_id)?;
     drop(conn);
 
     if paths.is_empty() {
@@ -38,7 +53,7 @@ pub fn analyze_track(
     app.emit(
         "analysis-progress",
         serde_json::json!({
-            "stage": "loading", "current": 0, "total": total
+            "projectId": project_id, "stage": "loading", "current": 0, "total": total
         }),
     )
     .ok();
@@ -55,7 +70,7 @@ pub fn analyze_track(
             app.emit(
                 "analysis-progress",
                 serde_json::json!({
-                    "stage": "loading", "current": i + 1, "total": total
+                    "projectId": project_id, "stage": "loading", "current": i + 1, "total": total
                 }),
             )
             .ok();
@@ -66,7 +81,7 @@ pub fn analyze_track(
     app.emit(
         "analysis-progress",
         serde_json::json!({
-            "stage": "displacement", "current": 0, "total": total
+            "projectId": project_id, "stage": "displacement", "current": 0, "total": total
         }),
     )
     .ok();
@@ -90,7 +105,7 @@ pub fn analyze_track(
                 app.emit(
                     "analysis-progress",
                     serde_json::json!({
-                        "stage": "displacement", "current": i + 1, "total": total
+                        "projectId": project_id, "stage": "displacement", "current": i + 1, "total": total
                     }),
                 )
                 .ok();
@@ -102,7 +117,7 @@ pub fn analyze_track(
     app.emit(
         "analysis-progress",
         serde_json::json!({
-            "stage": "flicker", "current": 0, "total": total
+            "projectId": project_id, "stage": "flicker", "current": 0, "total": total
         }),
     )
     .ok();
@@ -112,7 +127,7 @@ pub fn analyze_track(
     app.emit(
         "analysis-progress",
         serde_json::json!({
-            "stage": "flicker", "current": total, "total": total
+            "projectId": project_id, "stage": "flicker", "current": total, "total": total
         }),
     )
     .ok();
@@ -150,7 +165,7 @@ pub fn analyze_track(
     app.emit(
         "analysis-progress",
         serde_json::json!({
-            "stage": "done", "current": total, "total": total
+            "projectId": project_id, "stage": "done", "current": total, "total": total
         }),
     )
     .ok();
@@ -234,15 +249,7 @@ pub fn cloud_consistency_check(
     drop(cfg);
 
     let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
-    let mut stmt = conn
-        .prepare("SELECT source_path FROM assets WHERE track_id = ?1 ORDER BY start_frame")
-        .map_err(|e| format!("查询资产失败: {}", e))?;
-    let paths: Vec<String> = stmt
-        .query_map(params![track_id], |row| row.get(0))
-        .map_err(|e| format!("读取路径失败: {}", e))?
-        .filter_map(|p| p.ok())
-        .collect();
-    drop(stmt);
+    let paths = load_track_paths(&conn, &project_id, &track_id)?;
     drop(conn);
 
     if paths.is_empty() {
@@ -252,7 +259,7 @@ pub fn cloud_consistency_check(
     app.emit(
         "analysis-progress",
         serde_json::json!({
-            "stage": "loading", "current": 0, "total": paths.len()
+            "projectId": project_id, "stage": "loading", "current": 0, "total": paths.len()
         }),
     )
     .ok();
@@ -268,7 +275,7 @@ pub fn cloud_consistency_check(
     app.emit(
         "analysis-progress",
         serde_json::json!({
-            "stage": "consistency", "current": 0, "total": 1
+            "projectId": project_id, "stage": "consistency", "current": 0, "total": 1
         }),
     )
     .ok();
@@ -287,7 +294,7 @@ pub fn cloud_consistency_check(
 
     let report = AnalysisReport {
         id: uuid::Uuid::new_v4().to_string(),
-        project_id,
+        project_id: project_id.clone(),
         track_id,
         analyzed_at: chrono::Utc::now().timestamp_millis(),
         total_frames: paths.len() as i64,
@@ -311,10 +318,53 @@ pub fn cloud_consistency_check(
     app.emit(
         "analysis-progress",
         serde_json::json!({
-            "stage": "done", "current": 1, "total": 1
+            "projectId": project_id, "stage": "done", "current": 1, "total": 1
         }),
     )
     .ok();
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_track_paths;
+    use rusqlite::{params, Connection};
+
+    #[test]
+    fn track_paths_require_matching_project_ownership() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "CREATE TABLE tracks (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL
+            );
+            CREATE TABLE assets (
+                id TEXT PRIMARY KEY,
+                track_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                start_frame INTEGER NOT NULL
+            );",
+        )
+        .expect("create schema");
+        conn.execute(
+            "INSERT INTO tracks (id, project_id) VALUES (?1, ?2)",
+            params!["track-b", "project-b"],
+        )
+        .expect("insert track");
+        conn.execute(
+            "INSERT INTO assets (id, track_id, source_path, start_frame)
+             VALUES (?1, ?2, ?3, ?4)",
+            params!["asset-b", "track-b", "B:/frame.png", 0],
+        )
+        .expect("insert asset");
+
+        assert!(load_track_paths(&conn, "project-a", "track-b")
+            .expect("mismatched project query")
+            .is_empty());
+        assert_eq!(
+            load_track_paths(&conn, "project-b", "track-b").expect("owned track query"),
+            vec!["B:/frame.png".to_string()],
+        );
+    }
 }

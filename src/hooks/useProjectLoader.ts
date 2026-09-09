@@ -13,6 +13,7 @@ import {
   projectSessionController,
   type ProjectSessionToken,
 } from "../core/projectSession";
+import { useAnalysisStore } from "../stores/analysisStore";
 
 /**
  * 当项目切换时，从数据库加载轨道和帧数据
@@ -28,10 +29,13 @@ export function useProjectLoader() {
   const loadAnimationDocument = useAnimationDocumentStore((s) => s.loadForProject);
   const beginProjectLoad = useAnimationDocumentStore((s) => s.beginProjectLoad);
   const setBaselinePoints = useBaselineStore((s) => s.setPoints);
+  const beginAnalysisProject = useAnalysisStore((s) => s.beginProject);
+  const loadAnalysisReports = useAnalysisStore((s) => s.loadReports);
 
   useEffect(() => {
     if (!projectId) {
       setBaselinePoints([]);
+      beginAnalysisProject(null);
       return;
     }
     const projectSnapshot = useProjectStore.getState().project;
@@ -41,6 +45,8 @@ export function useProjectLoader() {
     beginProjectLoad();
     setTracks([]);
     setBaselinePoints([]);
+    beginAnalysisProject(projectId);
+    void loadAnalysisReports(projectId);
     useTimelineStore.getState().setPlaying(false);
 
     const loadProjectData = async () => {
@@ -74,8 +80,10 @@ export function useProjectLoader() {
       cancelled = true;
     };
   }, [
+    beginAnalysisProject,
     beginProjectLoad,
     loadAnimationDocument,
+    loadAnalysisReports,
     markLoadError,
     markLoadReady,
     projectId,

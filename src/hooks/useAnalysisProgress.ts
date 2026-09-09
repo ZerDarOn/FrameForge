@@ -1,6 +1,9 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { useAnalysisStore } from "../stores/analysisStore";
+import {
+  useAnalysisStore,
+  type AnalysisProgressEvent,
+} from "../stores/analysisStore";
 import { isTauriRuntime } from "../core/runtime";
 
 /**
@@ -12,10 +15,10 @@ export function useAnalysisProgress() {
     let unlistenFn: (() => void) | null = null;
     if (!isTauriRuntime()) return;
 
-    void listen<{ stage: string; current: number; total: number }>(
+    void listen<AnalysisProgressEvent>(
       "analysis-progress",
       (event) => {
-        useAnalysisStore.getState().setProgress(event.payload);
+        useAnalysisStore.getState().handleProgress(event.payload);
       }
     )
       .then((fn) => {
@@ -23,7 +26,7 @@ export function useAnalysisProgress() {
       })
       .catch((error) => {
         console.info("[FrameForge] analysis progress listener unavailable", {
-          error: error instanceof Error ? error.message : String(error),
+          reason: error instanceof Error ? error.name : "unknown",
         });
       });
 

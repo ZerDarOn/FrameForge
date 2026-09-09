@@ -21,6 +21,10 @@ import {
   type PixelPaletteAnalysis,
   type TransparencyCleanupResult,
 } from "../../core/pixelCleanup";
+import {
+  decodePixelImageDataUrl,
+  type ReadContentImage,
+} from "../../core/pixelImageCodec";
 import { useAnimationDocumentStore } from "../../stores/animationDocumentStore";
 import { useTimelineStore } from "../../stores/timelineStore";
 import type { Asset } from "../../types/asset";
@@ -36,7 +40,6 @@ import type {
 type PixelTool = "pencil" | "eraser" | "fill" | "eyedropper" | "selection";
 type CleanupMode = "transparency" | "palette";
 type CleanupPreview = TransparencyCleanupResult | PaletteReductionResult;
-const MAX_EDITABLE_PIXELS = 4 * 1024 * 1024;
 const MAX_BATCH_CLEANUP_CELS = 64;
 const MAX_BATCH_PALETTE_PIXELS = 8 * 1024 * 1024;
 const MAX_PALETTE_DITHER_STRENGTH = 64;
@@ -51,12 +54,6 @@ const PIXEL_TOOL_LABELS: Record<PixelTool, string> = {
 interface Props {
   asset: Asset;
   onClose: () => void;
-}
-
-interface ReadContentImage {
-  pngDataUrl: string;
-  width: number;
-  height: number;
 }
 
 interface WrittenContentRevision {
@@ -83,26 +80,6 @@ function colorToHex(color: RgbaColor) {
     .slice(0, 3)
     .map((channel) => channel.toString(16).padStart(2, "0"))
     .join("")}`;
-}
-
-async function decodePixelImage(dataUrl: string): Promise<PixelImage> {
-  const image = new Image();
-  await new Promise<void>((resolve, reject) => {
-    image.onload = () => resolve();
-    image.onerror = () => reject(new Error("无法解码待编辑图片"));
-    image.src = dataUrl;
-  });
-  if (image.naturalWidth * image.naturalHeight > MAX_EDITABLE_PIXELS) {
-    throw new Error("图片超过像素编辑器 4M 像素上限");
-  }
-  const canvas = document.createElement("canvas");
-  canvas.width = image.naturalWidth;
-  canvas.height = image.naturalHeight;
-  const context = canvas.getContext("2d", { willReadFrequently: true });
-  if (!context) throw new Error("浏览器不支持 Canvas 2D");
-  context.drawImage(image, 0, 0);
-  const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
-  return { width: canvas.width, height: canvas.height, data: pixels.data };
 }
 
 function encodePixelImage(image: PixelImage) {
@@ -198,7 +175,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     setError(null);
     setBusy(true);
     invoke<ReadContentImage>("read_content_image", { filePath: content.sourcePath })
-      .then((result) => decodePixelImage(result.pngDataUrl))
+      .then((result) => decodePixelImageDataUrl(result.pngDataUrl, "无法解码待编辑图片"))
       .then((loaded) => {
         if (!cancelled) updateImage(loaded);
       })
@@ -435,7 +412,9 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
               ? current
               : await invoke<ReadContentImage>("read_content_image", {
                   filePath: sourceContent.sourcePath,
-                }).then((result) => decodePixelImage(result.pngDataUrl));
+                }).then((result) =>
+                  decodePixelImageDataUrl(result.pngDataUrl, "无法解码待编辑图片"),
+                );
           totalPixels += sourceImage.width * sourceImage.height;
           if (totalPixels > MAX_BATCH_PALETTE_PIXELS) {
             throw new Error("共享色板预览累计像素超过 8M 上限，请减少所选画格");
@@ -628,7 +607,9 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
             ? imageRef.current
             : await invoke<ReadContentImage>("read_content_image", {
                 filePath: sourceContent.sourcePath,
-              }).then((result) => decodePixelImage(result.pngDataUrl));
+              }).then((result) =>
+                decodePixelImageDataUrl(result.pngDataUrl, "无法解码待编辑图片"),
+              );
         if (!sourceImage) throw new Error("当前画格图片尚未加载完成");
         const cleaned =
           cleanupMode === "transparency"

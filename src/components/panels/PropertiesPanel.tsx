@@ -1,10 +1,24 @@
-import { useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useRef, useState } from "react";
+import {
+  createOpaqueBottomAlignment,
+  findOpaquePixelBounds,
+  type OpaqueBottomAlignmentEntry,
+  type OpaquePixelBounds,
+} from "../../core/pixelBaseline";
+import {
+  decodePixelImageDataUrl,
+  type ReadContentImage,
+} from "../../core/pixelImageCodec";
+import { projectSessionController } from "../../core/projectSession";
+import { useAnimationDocumentStore } from "../../stores/animationDocumentStore";
 import { useUIStore } from "../../stores/uiStore";
 import { useTimelineStore } from "../../stores/timelineStore";
 import { useBaselineStore } from "../../stores/baselineStore";
 import { useAnalysisStore } from "../../stores/analysisStore";
 import type { AnalysisReport } from "../../types/analysis";
 import { useProjectStore } from "../../stores/projectStore";
+import type { AnimationDocument } from "../../types/animationDocument";
 
 export function PropertiesPanel() {
   const tab = useUIStore((s) => s.propertiesTab);
@@ -86,9 +100,228 @@ interface BatchTransformInfoProps {
   disabled: boolean;
 }
 
+const MAX_OPAQUE_ALIGNMENT_CELS = 64;
+const OPAQUE_ALIGNMENT_ALPHA_THRESHOLD = 16;
+
+interface OpaqueAlignmentPreview {
+  signature: string;
+  projectId: string;
+  animationId: string;
+  entries: OpaqueBottomAlignmentEntry[];
+}
+
+function describeError(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function getOpaqueAlignmentSelection(
+  document: AnimationDocument | null,
+  selectedAssetIds: string[],
+) {
+  const animation = document?.animations[0];
+  if (!document || !animation) return null;
+  const selected = new Set(selectedAssetIds);
+  const cels = animation.cels
+    .filter((cel) => selected.has(cel.id))
+    .sort((left, right) => left.id.localeCompare(right.id));
+  return {
+    animation,
+    cels,
+    signature: [
+      document.projectId,
+      document.revision,
+      animation.id,
+      ...cels.map((cel) => `${cel.id}:${cel.contentRevisionId}`),
+    ].join("|"),
+  };
+}
+
 function BatchTransformInfo({ count, disabled }: BatchTransformInfoProps) {
   const nudge = useTimelineStore((state) => state.nudgeSelectedAssets);
   const alignBottom = useTimelineStore((state) => state.alignSelectedAssetsBottom);
+  const selectedAssetIds = useTimelineStore((state) => state.selectedAssetIds);
+  const document = useAnimationDocumentStore((state) => state.document);
+  const project = useProjectStore((state) => state.project);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<OpaqueAlignmentPreview | null>(null);
+  const analysisSequence = useRef(0);
+  const selection = getOpaqueAlignmentSelection(document, selectedAssetIds);
+  const selectionSignature = selection?.signature ?? "";
+
+  useEffect(() => {
+    analysisSequence.current += 1;
+    setIsAnalyzing(false);
+    setAnalysisError(null);
+    setPreview(null);
+  }, [selectionSignature]);
+
+  const analyzeOpaqueBottom = async () => {
+    const token = projectSessionController.snapshot();
+    const currentSelection = getOpaqueAlignmentSelection(
+      useAnimationDocumentStore.getState().document,
+      useTimelineStore.getState().selectedAssetIds,
+    );
+    if (
+      !project ||
+      !token ||
+      project.id !== token.projectId ||
+      !projectSessionController.isCurrent(token, true) ||
+      !currentSelection ||
+      currentSelection.cels.length < 2
+    ) {
+      setAnalysisError("当前项目或选择已变化，请重新选择后再分析");
+      return;
+    }
+    if (currentSelection.cels.length > MAX_OPAQUE_ALIGNMENT_CELS) {
+      setAnalysisError(`一次最多分析 ${MAX_OPAQUE_ALIGNMENT_CELS} 个画格`);
+      return;
+    }
+    if (
+      currentSelection.cels.some((cel) =>
+        currentSelection.animation.layers.find((layer) => layer.id === cel.layerId)?.locked,
+      )
+    ) {
+      setAnalysisError("选择中包含锁定图层，无法分析并应用");
+      return;
+    }
+
+    const requestId = ++analysisSequence.current;
+    setIsAnalyzing(true);
+    setAnalysisError(null);
+    setPreview(null);
+    console.info("[FrameForge] opaque-bottom analysis started", {
+      projectId: project.id,
+      operation: "analyze-opaque-bottom",
+      assetCount: currentSelection.cels.length,
+    });
+    try {
+      const currentDocument = useAnimationDocumentStore.getState().document;
+      if (!currentDocument || currentDocument.projectId !== project.id) {
+        throw new Error("当前项目已变化，请重新分析");
+      }
+      const contentById = new Map(
+        currentDocument.contentRevisions.map((content) => [content.id, content]),
+      );
+      const analyzedByPath = new Map<
+        string,
+        { width: number; height: number; bounds: OpaquePixelBounds }
+      >();
+      const inputs = [];
+      for (const cel of currentSelection.cels) {
+        if (
+          requestId !== analysisSequence.current ||
+          !projectSessionController.isCurrent(token, true)
+        ) {
+          return;
+        }
+        const content = contentById.get(cel.contentRevisionId);
+        if (!content) throw new Error("所选画格缺少内容版本，无法分析");
+        let analyzed = analyzedByPath.get(content.sourcePath);
+        if (!analyzed) {
+          const result = await invoke<ReadContentImage>("read_content_image", {
+            filePath: content.sourcePath,
+          });
+          const image = await decodePixelImageDataUrl(
+            result.pngDataUrl,
+            "无法解码脚底分析图片",
+          );
+          if (result.width !== image.width || result.height !== image.height) {
+            throw new Error("图片尺寸与读取结果不一致");
+          }
+          const bounds = findOpaquePixelBounds(image, OPAQUE_ALIGNMENT_ALPHA_THRESHOLD);
+          if (!bounds) throw new Error("所选画格中有完全透明图像，无法估算脚底");
+          analyzed = { width: image.width, height: image.height, bounds };
+          analyzedByPath.set(content.sourcePath, analyzed);
+        }
+        inputs.push({
+          celId: cel.id,
+          contentWidth: analyzed.width,
+          contentHeight: analyzed.height,
+          bounds: analyzed.bounds,
+          transform: cel.transform,
+        });
+      }
+      if (
+        requestId !== analysisSequence.current ||
+        !projectSessionController.isCurrent(token, true) ||
+        getOpaqueAlignmentSelection(
+          useAnimationDocumentStore.getState().document,
+          useTimelineStore.getState().selectedAssetIds,
+        )?.signature !== currentSelection.signature
+      ) {
+        return;
+      }
+      const suggestion = createOpaqueBottomAlignment(inputs);
+      setPreview({
+        signature: currentSelection.signature,
+        projectId: project.id,
+        animationId: currentSelection.animation.id,
+        entries: suggestion.entries,
+      });
+      console.info("[FrameForge] opaque-bottom analysis completed", {
+        projectId: project.id,
+        operation: "analyze-opaque-bottom",
+        assetCount: suggestion.entries.length,
+      });
+    } catch (error) {
+      if (requestId !== analysisSequence.current) return;
+      setAnalysisError(describeError(error));
+      console.info("[FrameForge] opaque-bottom analysis failed", {
+        projectId: project.id,
+        operation: "analyze-opaque-bottom",
+        assetCount: currentSelection.cels.length,
+      });
+    } finally {
+      if (requestId === analysisSequence.current) setIsAnalyzing(false);
+    }
+  };
+
+  const applyOpaqueBottom = () => {
+    if (!preview) return;
+    const currentDocumentState = useAnimationDocumentStore.getState();
+    const currentSelection = getOpaqueAlignmentSelection(
+      currentDocumentState.document,
+      useTimelineStore.getState().selectedAssetIds,
+    );
+    if (
+      !currentDocumentState.document ||
+      preview.signature !== currentSelection?.signature ||
+      preview.projectId !== currentDocumentState.document.projectId ||
+      !projectSessionController.isReadyFor(preview.projectId)
+    ) {
+      setPreview(null);
+      setAnalysisError("建议已过期，请重新分析后再应用");
+      return;
+    }
+    if (
+      currentSelection.cels.some((cel) =>
+        currentSelection.animation.layers.find((layer) => layer.id === cel.layerId)?.locked,
+      )
+    ) {
+      setPreview(null);
+      setAnalysisError("选择中包含锁定图层，建议未应用");
+      return;
+    }
+    const entries = preview.entries
+      .filter((entry) => Math.abs(entry.deltaY) > 1e-6)
+      .map((entry) => ({ celId: entry.celId, transform: entry.transform }));
+    if (entries.length === 0) return;
+    console.info("[FrameForge] opaque-bottom alignment applied", {
+      projectId: preview.projectId,
+      operation: "apply-opaque-bottom",
+      assetCount: entries.length,
+    });
+    currentDocumentState.execute({
+      type: "set_cel_transforms",
+      animationId: preview.animationId,
+      entries,
+    });
+    setPreview(null);
+  };
+
+  const changedEntries = preview?.entries.filter((entry) => Math.abs(entry.deltaY) > 1e-6) ?? [];
+  const deltaValues = changedEntries.map((entry) => entry.deltaY);
   const buttonClass = "rounded bg-gray-800 px-3 py-2 text-gray-300 hover:bg-gray-700 disabled:opacity-40";
   return (
     <div className="space-y-3">
@@ -110,6 +343,42 @@ function BatchTransformInfo({ count, disabled }: BatchTransformInfoProps) {
         >
           底边对齐
         </button>
+        <div className="pt-2 text-[10px] leading-relaxed text-gray-500">
+          透明脚底按 alpha≥{OPAQUE_ALIGNMENT_ALPHA_THRESHOLD} 的可见像素估算，分析后不会自动应用。
+        </div>
+        <button
+          type="button"
+          className="mt-1 w-full rounded bg-orange-900/40 px-3 py-2 text-orange-300 hover:bg-orange-900/60 disabled:opacity-40"
+          disabled={disabled || isAnalyzing || count > MAX_OPAQUE_ALIGNMENT_CELS}
+          onClick={() => void analyzeOpaqueBottom()}
+        >
+          {isAnalyzing ? "正在分析透明脚底…" : "分析透明脚底"}
+        </button>
+        {preview && (
+          <div className="mt-2 rounded border border-orange-800/60 bg-orange-950/30 p-2 text-[10px] text-orange-200">
+            {changedEntries.length === 0 ? (
+              <div>所选画格的透明脚底已经对齐。</div>
+            ) : (
+              <>
+                <div>
+                  建议移动 {changedEntries.length}/{preview.entries.length} 个画格，Y 偏移范围 {Math.min(...deltaValues).toFixed(1)} 到 {Math.max(...deltaValues).toFixed(1)} px。
+                </div>
+                <button
+                  type="button"
+                  className="mt-2 w-full rounded bg-orange-600 px-3 py-1.5 text-white hover:bg-orange-500"
+                  onClick={applyOpaqueBottom}
+                >
+                  应用脚底建议
+                </button>
+              </>
+            )}
+          </div>
+        )}
+        {analysisError && (
+          <div className="mt-2 rounded border border-red-800/60 bg-red-950/40 px-2 py-2 text-[10px] text-red-300">
+            脚底分析失败：{analysisError}
+          </div>
+        )}
       </Section>
       {disabled && <div className="text-amber-400">选择中包含锁定图层，整批不会修改。</div>}
     </div>

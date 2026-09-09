@@ -332,6 +332,14 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     setBatchPalettePreviewSignature(null);
   };
 
+  const handleUseBackgroundSuggestion = () => {
+    if (!backgroundSuggestion) return;
+    setCleanupColor(colorToHex(backgroundSuggestion.color));
+    setCleanupTolerance(backgroundSuggestion.recommendedTolerance);
+    setCleanupPreview(null);
+    setBatchPalettePreviewSignature(null);
+  };
+
   const handleCleanupModeChange = (value: CleanupMode) => {
     setCleanupMode(value);
     setCleanupPreview(null);
@@ -1138,9 +1146,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                     <button
                       type="button"
                       className="rounded bg-cyan-800 px-2 py-1 text-white hover:bg-cyan-700"
-                      onClick={() =>
-                        handleCleanupColorChange(colorToHex(backgroundSuggestion.color))
-                      }
+                      onClick={handleUseBackgroundSuggestion}
                       disabled={busy}
                     >
                       采用建议
@@ -1154,12 +1160,13 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
                     <span>
                       {colorToHex(backgroundSuggestion.color).toUpperCase()} · 主色范围 {backgroundSuggestion.matchedEdgePixels}/
                       {backgroundSuggestion.opaqueEdgePixels} 个边缘像素（
-                      {Math.round(backgroundSuggestion.confidence * 100)}%）
+                      {Math.round(backgroundSuggestion.confidence * 100)}%）· 建议容差 ±
+                      {backgroundSuggestion.recommendedTolerance}
                     </span>
                   </div>
                   {backgroundSuggestion.confidence < 0.6 && (
                     <div className="mt-1 text-amber-400">
-                      边缘颜色较分散，请先用低容差检查预览。
+                      边缘颜色较分散，请仔细检查建议参数下的预览。
                     </div>
                   )}
                 </div>

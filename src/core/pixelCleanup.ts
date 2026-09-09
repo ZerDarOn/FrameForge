@@ -29,6 +29,7 @@ export interface PixelBackgroundSuggestion {
   matchedEdgePixels: number;
   opaqueEdgePixels: number;
   confidence: number;
+  recommendedTolerance: number;
 }
 
 export interface TransparencyCleanupResult {
@@ -60,6 +61,20 @@ interface ColorSample {
   greenSum: number;
   blueSum: number;
   count: number;
+}
+
+interface BackgroundColorSample {
+  key: number;
+  redSum: number;
+  greenSum: number;
+  blueSum: number;
+  count: number;
+  redMin: number;
+  redMax: number;
+  greenMin: number;
+  greenMax: number;
+  blueMin: number;
+  blueMax: number;
 }
 
 function assertPixelImage(image: PixelImage) {
@@ -225,7 +240,7 @@ export function suggestPixelBackgroundColor(
   image: PixelImage,
 ): PixelBackgroundSuggestion | null {
   assertPixelImage(image);
-  const buckets = new Map<number, ColorSample>();
+  const buckets = new Map<number, BackgroundColorSample>();
   let opaqueEdgePixels = 0;
   const countPixel = (x: number, y: number) => {
     const index = (y * image.width + x) * 4;
@@ -240,19 +255,25 @@ export function suggestPixelBackgroundColor(
       bucket.greenSum += green;
       bucket.blueSum += blue;
       bucket.count += 1;
-      bucket.red = Math.round(bucket.redSum / bucket.count);
-      bucket.green = Math.round(bucket.greenSum / bucket.count);
-      bucket.blue = Math.round(bucket.blueSum / bucket.count);
+      bucket.redMin = Math.min(bucket.redMin, red);
+      bucket.redMax = Math.max(bucket.redMax, red);
+      bucket.greenMin = Math.min(bucket.greenMin, green);
+      bucket.greenMax = Math.max(bucket.greenMax, green);
+      bucket.blueMin = Math.min(bucket.blueMin, blue);
+      bucket.blueMax = Math.max(bucket.blueMax, blue);
     } else {
       buckets.set(key, {
         key,
-        red,
-        green,
-        blue,
         redSum: red,
         greenSum: green,
         blueSum: blue,
         count: 1,
+        redMin: red,
+        redMax: red,
+        greenMin: green,
+        greenMax: green,
+        blueMin: blue,
+        blueMax: blue,
       });
     }
     opaqueEdgePixels += 1;
@@ -271,11 +292,22 @@ export function suggestPixelBackgroundColor(
   const suggestion = [...buckets.values()].sort(
     (left, right) => right.count - left.count || left.key - right.key,
   )[0];
+  const red = Math.round(suggestion.redSum / suggestion.count);
+  const green = Math.round(suggestion.greenSum / suggestion.count);
+  const blue = Math.round(suggestion.blueSum / suggestion.count);
   return {
-    color: [suggestion.red, suggestion.green, suggestion.blue, 255],
+    color: [red, green, blue, 255],
     matchedEdgePixels: suggestion.count,
     opaqueEdgePixels,
     confidence: suggestion.count / opaqueEdgePixels,
+    recommendedTolerance: Math.max(
+      red - suggestion.redMin,
+      suggestion.redMax - red,
+      green - suggestion.greenMin,
+      suggestion.greenMax - green,
+      blue - suggestion.blueMin,
+      suggestion.blueMax - blue,
+    ),
   };
 }
 

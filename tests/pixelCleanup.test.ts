@@ -87,6 +87,7 @@ test("background suggestion uses opaque edge coverage and ignores interior pixel
     matchedEdgePixels: 6,
     opaqueEdgePixels: 8,
     confidence: 0.75,
+    recommendedTolerance: 0,
   });
 });
 
@@ -104,6 +105,7 @@ test("background suggestion is deterministic and rejects fully transparent edges
     matchedEdgePixels: 1,
     opaqueEdgePixels: 2,
     confidence: 0.5,
+    recommendedTolerance: 0,
   });
   assert.equal(suggestPixelBackgroundColor(transparent), null);
 });
@@ -120,6 +122,7 @@ test("background suggestion groups nearby edge shades into bounded RGB buckets",
     matchedEdgePixels: 2,
     opaqueEdgePixels: 3,
     confidence: 2 / 3,
+    recommendedTolerance: 1,
   });
 });
 

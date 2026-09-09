@@ -6,6 +6,7 @@ import {
   reducePixelImagesPalette,
   reducePixelPalette,
   removeColorAsTransparency,
+  suggestPixelBackgroundColor,
 } from "../src/core/pixelCleanup.ts";
 import type { PixelImage, RgbaColor } from "../src/types/pixelImage.ts";
 
@@ -66,6 +67,60 @@ test("background transparency uses bounded per-channel tolerance", () => {
     /tolerance/,
   );
   assert.throws(() => analyzePixelPalette(source, 0), /maxColors/);
+});
+
+test("background suggestion uses opaque edge coverage and ignores interior pixels", () => {
+  const source = image(3, 3, [
+    255, 0, 0, 255,
+    255, 0, 0, 255,
+    0, 0, 255, 255,
+    255, 0, 0, 255,
+    0, 255, 0, 255,
+    0, 0, 255, 255,
+    255, 0, 0, 255,
+    255, 0, 0, 128,
+    255, 0, 0, 255,
+  ]);
+
+  assert.deepEqual(suggestPixelBackgroundColor(source), {
+    color: [255, 0, 0, 255],
+    matchedEdgePixels: 6,
+    opaqueEdgePixels: 8,
+    confidence: 0.75,
+  });
+});
+
+test("background suggestion is deterministic and rejects fully transparent edges", () => {
+  const tied = image(2, 1, [255, 0, 0, 255, 0, 0, 255, 200]);
+  const transparent = image(2, 2, [
+    10, 20, 30, 0,
+    40, 50, 60, 0,
+    70, 80, 90, 0,
+    100, 110, 120, 0,
+  ]);
+
+  assert.deepEqual(suggestPixelBackgroundColor(tied), {
+    color: [0, 0, 255, 255],
+    matchedEdgePixels: 1,
+    opaqueEdgePixels: 2,
+    confidence: 0.5,
+  });
+  assert.equal(suggestPixelBackgroundColor(transparent), null);
+});
+
+test("background suggestion groups nearby edge shades into bounded RGB buckets", () => {
+  const source = image(3, 1, [
+    248, 16, 16, 255,
+    249, 17, 17, 255,
+    0, 0, 255, 255,
+  ]);
+
+  assert.deepEqual(suggestPixelBackgroundColor(source), {
+    color: [249, 17, 17, 255],
+    matchedEdgePixels: 2,
+    opaqueEdgePixels: 3,
+    confidence: 2 / 3,
+  });
 });
 
 test("palette reduction deterministically groups colors and preserves alpha", () => {

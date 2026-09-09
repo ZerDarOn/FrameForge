@@ -24,6 +24,13 @@ export interface PixelPaletteAnalysis {
   uniqueColorCount: number | null;
 }
 
+export interface PixelBackgroundSuggestion {
+  color: RgbaColor;
+  matchedEdgePixels: number;
+  opaqueEdgePixels: number;
+  confidence: number;
+}
+
 export interface TransparencyCleanupResult {
   image: PixelImage;
   changedPixels: number;
@@ -211,6 +218,64 @@ export function analyzePixelPalette(
     opaquePixels,
     transparentPixels,
     uniqueColorCount: uniqueColorCountKnown ? counts.size : null,
+  };
+}
+
+export function suggestPixelBackgroundColor(
+  image: PixelImage,
+): PixelBackgroundSuggestion | null {
+  assertPixelImage(image);
+  const buckets = new Map<number, ColorSample>();
+  let opaqueEdgePixels = 0;
+  const countPixel = (x: number, y: number) => {
+    const index = (y * image.width + x) * 4;
+    if (image.data[index + 3] === 0) return;
+    const red = image.data[index];
+    const green = image.data[index + 1];
+    const blue = image.data[index + 2];
+    const key = ((red >> 3) << 10) | ((green >> 3) << 5) | (blue >> 3);
+    const bucket = buckets.get(key);
+    if (bucket) {
+      bucket.redSum += red;
+      bucket.greenSum += green;
+      bucket.blueSum += blue;
+      bucket.count += 1;
+      bucket.red = Math.round(bucket.redSum / bucket.count);
+      bucket.green = Math.round(bucket.greenSum / bucket.count);
+      bucket.blue = Math.round(bucket.blueSum / bucket.count);
+    } else {
+      buckets.set(key, {
+        key,
+        red,
+        green,
+        blue,
+        redSum: red,
+        greenSum: green,
+        blueSum: blue,
+        count: 1,
+      });
+    }
+    opaqueEdgePixels += 1;
+  };
+
+  for (let x = 0; x < image.width; x += 1) countPixel(x, 0);
+  if (image.height > 1) {
+    for (let x = 0; x < image.width; x += 1) countPixel(x, image.height - 1);
+  }
+  for (let y = 1; y < image.height - 1; y += 1) {
+    countPixel(0, y);
+    if (image.width > 1) countPixel(image.width - 1, y);
+  }
+
+  if (opaqueEdgePixels === 0) return null;
+  const suggestion = [...buckets.values()].sort(
+    (left, right) => right.count - left.count || left.key - right.key,
+  )[0];
+  return {
+    color: [suggestion.red, suggestion.green, suggestion.blue, 255],
+    matchedEdgePixels: suggestion.count,
+    opaqueEdgePixels,
+    confidence: suggestion.count / opaqueEdgePixels,
   };
 }
 

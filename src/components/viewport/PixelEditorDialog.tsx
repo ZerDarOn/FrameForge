@@ -15,7 +15,9 @@ import {
   reducePixelImagesPalette,
   reducePixelPalette,
   removeColorAsTransparency,
+  suggestPixelBackgroundColor,
   type PaletteReductionResult,
+  type PixelBackgroundSuggestion,
   type PixelPaletteAnalysis,
   type TransparencyCleanupResult,
 } from "../../core/pixelCleanup";
@@ -141,6 +143,8 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
   const [paletteSize, setPaletteSize] = useState(16);
   const [paletteDitherStrength, setPaletteDitherStrength] = useState(0);
   const [paletteAnalysis, setPaletteAnalysis] = useState<PixelPaletteAnalysis | null>(null);
+  const [backgroundSuggestion, setBackgroundSuggestion] =
+    useState<PixelBackgroundSuggestion | null>(null);
   const [cleanupPreview, setCleanupPreview] = useState<CleanupPreview | null>(null);
   const [showCleanupPreview, setShowCleanupPreview] = useState(true);
   const [applyToSelection, setApplyToSelection] = useState(false);
@@ -297,6 +301,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     try {
       const analysis = analyzePixelPalette(current, 16);
       setPaletteAnalysis(analysis);
+      setBackgroundSuggestion(suggestPixelBackgroundColor(current));
       setCleanupColor(analysis.colors[0] ? colorToHex(analysis.colors[0].color) : "#000000");
       setCleanupTolerance(0);
       setPaletteSize(Math.max(2, Math.min(16, analysis.uniqueColorCount ?? 16)));
@@ -507,6 +512,7 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
     setBatchPalettePreviewSignature(null);
     setCleanupPreview(null);
     setPaletteAnalysis(null);
+    setBackgroundSuggestion(null);
   };
 
   const applyCleanupToSelection = async () => {
@@ -1102,27 +1108,67 @@ export function PixelEditorDialog({ asset, onClose }: Props) {
           </div>
 
           {cleanupMode === "transparency" && (
-            <div className="mb-3">
-              <div className="mb-1 text-xs text-gray-400">常用颜色</div>
-              <div className="grid grid-cols-8 gap-1">
-                {paletteAnalysis.colors.map((entry) => {
-                  const hex = colorToHex(entry.color);
-                  return (
-                    <button
-                      key={`${hex}-${entry.color[3]}`}
-                      type="button"
-                      className={`h-6 rounded border ${
-                        cleanupColor === hex ? "border-white" : "border-gray-600"
-                      }`}
-                      style={{ backgroundColor: hex, opacity: entry.color[3] / 255 }}
-                      onClick={() => handleCleanupColorChange(hex)}
-                      title={`${hex} · ${entry.count} 像素`}
-                      aria-label={`选择颜色 ${hex}，${entry.count} 像素`}
-                    />
-                  );
-                })}
+            <>
+              <div className="mb-3">
+                <div className="mb-1 text-xs text-gray-400">常用颜色</div>
+                <div className="grid grid-cols-8 gap-1">
+                  {paletteAnalysis.colors.map((entry) => {
+                    const hex = colorToHex(entry.color);
+                    return (
+                      <button
+                        key={`${hex}-${entry.color[3]}`}
+                        type="button"
+                        className={`h-6 rounded border ${
+                          cleanupColor === hex ? "border-white" : "border-gray-600"
+                        }`}
+                        style={{ backgroundColor: hex, opacity: entry.color[3] / 255 }}
+                        onClick={() => handleCleanupColorChange(hex)}
+                        title={`${hex} · ${entry.count} 像素`}
+                        aria-label={`选择颜色 ${hex}，${entry.count} 像素`}
+                      />
+                    );
+                  })}
+                </div>
               </div>
-            </div>
+
+              {backgroundSuggestion ? (
+                <div className="mb-3 rounded border border-cyan-900 bg-cyan-950/40 p-2 text-xs">
+                  <div className="flex items-center justify-between gap-2 text-cyan-200">
+                    <span>边缘背景建议</span>
+                    <button
+                      type="button"
+                      className="rounded bg-cyan-800 px-2 py-1 text-white hover:bg-cyan-700"
+                      onClick={() =>
+                        handleCleanupColorChange(colorToHex(backgroundSuggestion.color))
+                      }
+                      disabled={busy}
+                    >
+                      采用建议
+                    </button>
+                  </div>
+                  <div className="mt-1 flex items-center gap-2 text-gray-400">
+                    <span
+                      className="h-4 w-4 rounded border border-gray-600"
+                      style={{ backgroundColor: colorToHex(backgroundSuggestion.color) }}
+                    />
+                    <span>
+                      {colorToHex(backgroundSuggestion.color).toUpperCase()} · 主色范围 {backgroundSuggestion.matchedEdgePixels}/
+                      {backgroundSuggestion.opaqueEdgePixels} 个边缘像素（
+                      {Math.round(backgroundSuggestion.confidence * 100)}%）
+                    </span>
+                  </div>
+                  {backgroundSuggestion.confidence < 0.6 && (
+                    <div className="mt-1 text-amber-400">
+                      边缘颜色较分散，请先用低容差检查预览。
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="mb-3 rounded bg-gray-800 px-2 py-1.5 text-xs text-gray-500">
+                  边缘没有非透明像素，未生成背景色建议。
+                </div>
+              )}
+            </>
           )}
 
           {cleanupMode === "transparency" ? (

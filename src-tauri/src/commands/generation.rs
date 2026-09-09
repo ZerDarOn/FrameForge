@@ -411,7 +411,11 @@ pub async fn generate_pixel_art(
     if outcome.is_err() {
         cleanup_generated_assets(&db, &results);
     }
-    if outcome.as_deref().err() == Some(GENERATION_CANCELLED) {
+    if outcome
+        .as_ref()
+        .err()
+        .is_some_and(|error| error == GENERATION_CANCELLED)
+    {
         app.emit(
             "generation-progress",
             serde_json::json!({

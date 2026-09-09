@@ -385,7 +385,7 @@ pub fn import_files_to_new_track(
             .map_err(|e| format!("提交导入事务失败: {}", e))?;
         Ok(TrackInfo {
             id: track_id,
-            project_id,
+            project_id: project_id.clone(),
             name,
             track_type,
             visible: true,
@@ -1424,7 +1424,7 @@ pub fn export_png_sequence(
         // 创建画布（透明背景）
         let mut canvas = image::RgbaImage::new(canvas_w as u32, canvas_h as u32);
 
-        for (source_path, tx, ty, sx, sy, rot) in layers {
+        for (source_path, tx, ty, sx, sy, _rot) in layers {
             let src_path = Path::new(source_path);
             if !src_path.exists() {
                 continue;

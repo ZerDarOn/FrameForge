@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -42,11 +42,31 @@ export function VideoImportDialog({ onClose }: VideoImportDialogProps) {
   const [sampleFps, setSampleFps] = useState(() => Math.min(project?.fps ?? 12, 12));
   const [selecting, setSelecting] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [progress, setProgress] = useState<VideoImportProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const activeOperationRef = useRef<string | null>(null);
+  const backendReadyRef = useRef(false);
+  const cancelRequestedRef = useRef(false);
+  const cancelSentRef = useRef(false);
 
   useEffect(() => {
-    if (project?.id !== initialProjectId) onClose();
+    if (project?.id === initialProjectId) return;
+    const operationId = activeOperationRef.current;
+    if (operationId && initialProjectId) {
+      cancelRequestedRef.current = true;
+      void invoke<boolean>("cancel_video_import", {
+        operationId,
+        projectId: initialProjectId,
+      }).catch((cancelError) => {
+        console.warn("[FrameForge] stale video import cancellation failed", {
+          operationId,
+          projectId: initialProjectId,
+          error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+        });
+      });
+    }
+    onClose();
   }, [initialProjectId, onClose, project?.id]);
 
   if (!project || project.id !== initialProjectId) return null;
@@ -65,6 +85,45 @@ export function VideoImportDialog({ onClose }: VideoImportDialogProps) {
     sampleFps <= projectFps &&
     plannedFrameCount >= 1 &&
     plannedFrameCount <= 10_000;
+
+  const sendCancellation = async (operationId: string, projectId: string) => {
+    if (cancelSentRef.current) return;
+    cancelSentRef.current = true;
+    try {
+      const accepted = await invoke<boolean>("cancel_video_import", {
+        operationId,
+        projectId,
+      });
+      if (!accepted && activeOperationRef.current === operationId) {
+        cancelRequestedRef.current = false;
+        cancelSentRef.current = false;
+        setCancelling(false);
+        setError("视频已进入项目写入阶段，无法取消。");
+      }
+    } catch (cancelError) {
+      if (activeOperationRef.current !== operationId) return;
+      cancelRequestedRef.current = false;
+      cancelSentRef.current = false;
+      setCancelling(false);
+      const message = cancelError instanceof Error ? cancelError.message : String(cancelError);
+      setError(`取消失败：${message}`);
+    }
+  };
+
+  const handleCancel = () => {
+    if (!importing) {
+      onClose();
+      return;
+    }
+    const operationId = activeOperationRef.current;
+    if (!operationId || cancelling) return;
+    cancelRequestedRef.current = true;
+    setCancelling(true);
+    setError(null);
+    if (backendReadyRef.current) {
+      void sendCancellation(operationId, project.id);
+    }
+  };
 
   const handleSelectSource = async () => {
     const token = projectSessionController.snapshot();
@@ -117,7 +176,12 @@ export function VideoImportDialog({ onClose }: VideoImportDialogProps) {
     }
 
     const operationId = crypto.randomUUID();
+    activeOperationRef.current = operationId;
+    backendReadyRef.current = false;
+    cancelRequestedRef.current = false;
+    cancelSentRef.current = false;
     setImporting(true);
+    setCancelling(false);
     setError(null);
     setProgress({
       operationId,
@@ -131,7 +195,11 @@ export function VideoImportDialog({ onClose }: VideoImportDialogProps) {
     try {
       unlisten = await listen<VideoImportProgress>("video-import-progress", ({ payload }) => {
         if (payload.operationId === operationId && payload.projectId === project.id) {
+          backendReadyRef.current = true;
           setProgress(payload);
+          if (cancelRequestedRef.current) {
+            void sendCancellation(operationId, project.id);
+          }
         }
       });
       const result = await importTrackForSession(
@@ -174,15 +242,27 @@ export function VideoImportDialog({ onClose }: VideoImportDialogProps) {
         setError("项目状态已变化，视频未开始导入。");
       }
     } catch (importError) {
-      setError(importError instanceof Error ? importError.message : String(importError));
+      const message = importError instanceof Error ? importError.message : String(importError);
+      if (message.includes("VIDEO_IMPORT_CANCELLED")) {
+        onClose();
+      } else {
+        setError(message);
+      }
     } finally {
       unlisten?.();
+      activeOperationRef.current = null;
+      backendReadyRef.current = false;
+      cancelRequestedRef.current = false;
+      cancelSentRef.current = false;
       setImporting(false);
+      setCancelling(false);
     }
   };
 
   const progressLabel =
-    progress?.stage === "committing"
+    cancelling
+      ? "正在取消视频导入…"
+      : progress?.stage === "committing"
       ? "正在写入项目…"
       : progress?.stage === "extracting"
         ? "正在抽取视频帧…"
@@ -201,9 +281,9 @@ export function VideoImportDialog({ onClose }: VideoImportDialogProps) {
           <button
             type="button"
             className="px-2 text-lg text-gray-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-30"
-            onClick={onClose}
-            disabled={importing}
-            aria-label="关闭"
+            onClick={handleCancel}
+            disabled={cancelling}
+            aria-label={importing ? "取消导入" : "关闭"}
           >
             ×
           </button>
@@ -338,10 +418,10 @@ export function VideoImportDialog({ onClose }: VideoImportDialogProps) {
           <button
             type="button"
             className="rounded bg-gray-800 px-5 py-2 text-sm text-gray-300 hover:bg-gray-700 disabled:opacity-40"
-            onClick={onClose}
-            disabled={importing}
+            onClick={handleCancel}
+            disabled={cancelling}
           >
-            取消
+            {cancelling ? "正在取消…" : "取消"}
           </button>
           <button
             type="button"
@@ -349,7 +429,7 @@ export function VideoImportDialog({ onClose }: VideoImportDialogProps) {
             onClick={handleImport}
             disabled={importing || selecting || !sourcePath || !name.trim() || !validRange}
           >
-            {importing ? "导入中…" : "导入视频帧"}
+            {cancelling ? "正在取消…" : importing ? "导入中…" : "导入视频帧"}
           </button>
         </div>
       </div>

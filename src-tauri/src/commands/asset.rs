@@ -3,10 +3,17 @@ use image::{AnimationDecoder, ImageDecoder};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs::File,
-    io::BufReader,
+    io::{BufReader, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -21,6 +28,111 @@ const MAX_VIDEO_CANVAS_PIXELS: u64 = 16_777_216;
 const MAX_VIDEO_INPUT_BYTES: u64 = 4_294_967_296;
 const MAX_VIDEO_OUTPUT_BYTES: u64 = 1_073_741_824;
 const FFMPEG_DIRECTORY_ENV: &str = "FRAMEFORGE_FFMPEG_DIR";
+const VIDEO_IMPORT_CANCELLED: &str = "VIDEO_IMPORT_CANCELLED";
+
+struct VideoImportRecord {
+    project_id: String,
+    cancellation: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+pub struct VideoImportRegistry {
+    operations: Mutex<HashMap<String, VideoImportRecord>>,
+}
+
+impl VideoImportRegistry {
+    fn register(&self, operation_id: &str, project_id: &str) -> Result<Arc<AtomicBool>, String> {
+        let mut operations = self
+            .operations
+            .lock()
+            .map_err(|error| format!("视频导入注册表锁定失败: {}", error))?;
+        if operations.contains_key(operation_id) {
+            return Err("视频导入 operationId 已存在".to_string());
+        }
+        let cancellation = Arc::new(AtomicBool::new(false));
+        operations.insert(
+            operation_id.to_string(),
+            VideoImportRecord {
+                project_id: project_id.to_string(),
+                cancellation: cancellation.clone(),
+            },
+        );
+        Ok(cancellation)
+    }
+
+    fn request_cancel(&self, operation_id: &str, project_id: &str) -> Result<bool, String> {
+        let operations = self
+            .operations
+            .lock()
+            .map_err(|error| format!("视频导入注册表锁定失败: {}", error))?;
+        let Some(record) = operations.get(operation_id) else {
+            return Ok(false);
+        };
+        if record.project_id != project_id {
+            return Ok(false);
+        }
+        record.cancellation.store(true, Ordering::Release);
+        Ok(true)
+    }
+
+    fn finish(&self, operation_id: &str, project_id: &str) -> bool {
+        let Ok(mut operations) = self.operations.lock() else {
+            log::error!("video import registry lock poisoned while finishing");
+            return false;
+        };
+        let matches_project = operations
+            .get(operation_id)
+            .is_some_and(|record| record.project_id == project_id);
+        if !matches_project {
+            return false;
+        }
+        operations
+            .remove(operation_id)
+            .is_some_and(|record| !record.cancellation.load(Ordering::Acquire))
+    }
+}
+
+struct VideoImportRegistration<'a> {
+    registry: &'a VideoImportRegistry,
+    operation_id: String,
+    project_id: String,
+    cancellation: Arc<AtomicBool>,
+    active: bool,
+}
+
+impl<'a> VideoImportRegistration<'a> {
+    fn new(
+        registry: &'a VideoImportRegistry,
+        operation_id: &str,
+        project_id: &str,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            registry,
+            operation_id: operation_id.to_string(),
+            project_id: project_id.to_string(),
+            cancellation: registry.register(operation_id, project_id)?,
+            active: true,
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+    }
+
+    fn claim_commit(&mut self) -> bool {
+        let can_commit = self.registry.finish(&self.operation_id, &self.project_id);
+        self.active = false;
+        can_commit
+    }
+}
+
+impl Drop for VideoImportRegistration<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.registry.finish(&self.operation_id, &self.project_id);
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1209,8 +1321,10 @@ pub async fn import_video_to_new_track(
     let state_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let db = state_app.state::<DbState>();
+        let operations = state_app.state::<VideoImportRegistry>();
         import_video_to_new_track_blocking(
             db,
+            operations,
             &state_app,
             operation_id,
             project_id,
@@ -1229,6 +1343,7 @@ pub async fn import_video_to_new_track(
 #[allow(clippy::too_many_arguments)]
 fn import_video_to_new_track_blocking(
     db: State<'_, DbState>,
+    operations: State<'_, VideoImportRegistry>,
     app: &AppHandle,
     operation_id: String,
     project_id: String,
@@ -1270,6 +1385,7 @@ fn import_video_to_new_track_blocking(
             return Err("视频导入目标项目不存在".to_string());
         }
     }
+    let mut registration = VideoImportRegistration::new(&operations, &operation_id, &project_id)?;
 
     let _ = app.emit(
         "video-import-progress",
@@ -1282,6 +1398,9 @@ fn import_video_to_new_track_blocking(
         },
     );
     let video_info = inspect_video_path(&source_path)?;
+    if registration.is_cancelled() {
+        return Err(VIDEO_IMPORT_CANCELLED.to_string());
+    }
     if end_seconds > video_info.duration_seconds + 0.001 {
         return Err(format!(
             "抽帧结束时间不能超过视频时长 {:.3} 秒",
@@ -1342,23 +1461,11 @@ fn import_video_to_new_track_blocking(
         .args(["-start_number", "0", "-y"])
         .arg(&output_pattern)
         .stdin(Stdio::null())
-        .output();
-    match extraction {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            cleanup_import_output(&file_paths, &output_dir, "video");
-            log::warn!(
-                "video extraction failed: operation_id={}, project_id={}",
-                operation_id,
-                project_id
-            );
-            let details = bounded_process_error(&output.stderr);
-            return Err(if details.is_empty() {
-                "FFmpeg 视频抽帧失败".to_string()
-            } else {
-                format!("FFmpeg 视频抽帧失败: {}", details)
-            });
-        }
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match extraction {
+        Ok(child) => child,
         Err(error) => {
             cleanup_import_output(&file_paths, &output_dir, "video");
             log::warn!(
@@ -1368,6 +1475,72 @@ fn import_video_to_new_track_blocking(
             );
             return Err(format!("启动 FFmpeg 失败: {}", error));
         }
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        cleanup_import_output(&file_paths, &output_dir, "video");
+        return Err("无法读取 FFmpeg 错误输出".to_string());
+    };
+    let stderr_reader = thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut stderr = Vec::with_capacity(4_096);
+        let mut buffer = [0_u8; 1_024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let remaining = 4_096_usize.saturating_sub(stderr.len());
+                    stderr.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+            }
+        }
+        stderr
+    });
+    let extraction_status = loop {
+        if registration.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            cleanup_import_output(&file_paths, &output_dir, "video");
+            log::info!(
+                "video import cancelled: operation_id={}, project_id={}, stage=extracting",
+                operation_id,
+                project_id
+            );
+            return Err(VIDEO_IMPORT_CANCELLED.to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                cleanup_import_output(&file_paths, &output_dir, "video");
+                log::warn!(
+                    "video extraction status failed: operation_id={}, project_id={}",
+                    operation_id,
+                    project_id
+                );
+                return Err(format!("等待 FFmpeg 失败: {}", error));
+            }
+        }
+    };
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !extraction_status.success() {
+        cleanup_import_output(&file_paths, &output_dir, "video");
+        log::warn!(
+            "video extraction failed: operation_id={}, project_id={}",
+            operation_id,
+            project_id
+        );
+        let details = bounded_process_error(&stderr);
+        return Err(if details.is_empty() {
+            "FFmpeg 视频抽帧失败".to_string()
+        } else {
+            format!("FFmpeg 视频抽帧失败: {}", details)
+        });
     }
 
     let validation_result = (|| -> Result<Vec<PreparedImportedFrame>, String> {
@@ -1424,6 +1597,16 @@ fn import_video_to_new_track_blocking(
         }
     };
 
+    if !registration.claim_commit() {
+        cleanup_import_output(&file_paths, &output_dir, "video");
+        log::info!(
+            "video import cancelled: operation_id={}, project_id={}, stage=before_commit",
+            operation_id,
+            project_id
+        );
+        return Err(VIDEO_IMPORT_CANCELLED.to_string());
+    }
+
     let _ = app.emit(
         "video-import-progress",
         VideoImportProgress {
@@ -1459,6 +1642,22 @@ fn import_video_to_new_track_blocking(
         }
     }
     result
+}
+
+#[tauri::command]
+pub fn cancel_video_import(
+    operations: State<'_, VideoImportRegistry>,
+    operation_id: String,
+    project_id: String,
+) -> Result<bool, String> {
+    let accepted = operations.request_cancel(&operation_id, &project_id)?;
+    log::info!(
+        "video import cancellation requested: operation_id={}, project_id={}, accepted={}",
+        operation_id,
+        project_id,
+        accepted
+    );
+    Ok(accepted)
 }
 
 /// Atomically move one asset into a newly-created track.
@@ -2124,7 +2323,7 @@ pub fn export_gif(
 mod tests {
     use super::{
         gif_delay_to_ticks, parse_video_probe, plan_sprite_sheet_slices, plan_video_frame_timing,
-        SpriteSheetSliceRect, VideoFileInfo, VideoFrameTiming,
+        SpriteSheetSliceRect, VideoFileInfo, VideoFrameTiming, VideoImportRegistry,
     };
 
     #[test]
@@ -2228,6 +2427,33 @@ mod tests {
         assert!(plan_video_frame_timing(0.0, 1.0, 25.0, 24).is_err());
         assert!(plan_video_frame_timing(0.0, 1_001.0, 10.0, 24).is_err());
         assert!(plan_video_frame_timing(f64::NAN, 1.0, 10.0, 24).is_err());
+    }
+
+    #[test]
+    fn video_cancellation_is_scoped_to_the_operation_and_project() {
+        let operations = VideoImportRegistry::default();
+        let cancellation = operations
+            .register("operation-a", "project-a")
+            .expect("register");
+        assert!(operations.register("operation-a", "project-a").is_err());
+
+        assert!(!operations
+            .request_cancel("operation-a", "project-b")
+            .expect("wrong project"));
+        assert!(!cancellation.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(operations
+            .request_cancel("operation-a", "project-a")
+            .expect("matching project"));
+        assert!(cancellation.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!operations.finish("operation-a", "project-a"));
+
+        operations
+            .register("operation-b", "project-a")
+            .expect("register active import");
+        assert!(operations.finish("operation-b", "project-a"));
+        assert!(!operations
+            .request_cancel("operation-b", "project-a")
+            .expect("late cancellation"));
     }
 
     #[test]

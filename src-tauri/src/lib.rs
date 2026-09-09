@@ -26,6 +26,7 @@ pub fn run() {
             app.manage(DbState::new(conn));
             app.manage(ai::AiConfig::new(ai::config::AiConfigState::default()));
             app.manage(commands::generation::GenerationJobRegistry::default());
+            app.manage(commands::asset::VideoImportRegistry::default());
 
             Ok(())
         })
@@ -49,6 +50,7 @@ pub fn run() {
             commands::asset::import_gif_to_new_track,
             commands::asset::inspect_video_file,
             commands::asset::import_video_to_new_track,
+            commands::asset::cancel_video_import,
             commands::asset::extract_asset_to_new_track,
             commands::asset::import_frames_to_track,
             commands::asset::get_project_tracks,

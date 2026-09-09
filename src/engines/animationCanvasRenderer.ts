@@ -4,6 +4,26 @@ import type { AnimationDocument, ContentRevision } from "../types/animationDocum
 
 const MAX_EXPORT_FRAMES = 10_000;
 const MAX_EXPORT_RAW_PIXELS = 64 * 1024 * 1024;
+export const EXPORT_CANCELLED = "EXPORT_CANCELLED";
+
+function abortable<T>(task: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return task;
+  if (signal.aborted) return Promise.reject(new Error(EXPORT_CANCELLED));
+  return new Promise<T>((resolve, reject) => {
+    const handleAbort = () => reject(new Error(EXPORT_CANCELLED));
+    signal.addEventListener("abort", handleAbort, { once: true });
+    task.then(
+      (value) => {
+        signal.removeEventListener("abort", handleAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", handleAbort);
+        reject(error);
+      },
+    );
+  });
+}
 
 function sourceUrl(content: ContentRevision) {
   if (/^(asset:|blob:|data:|https?:)/.test(content.sourcePath)) {
@@ -87,7 +107,11 @@ export class AnimationCanvasRenderer {
     return canvas;
   }
 
-  async renderPngFrames(document: AnimationDocument, animationId: string) {
+  async renderPngFrames(
+    document: AnimationDocument,
+    animationId: string,
+    signal?: AbortSignal,
+  ) {
     const animation = document.animations.find((candidate) => candidate.id === animationId);
     if (!animation) throw new Error(`动画不存在: ${animationId}`);
     const totalTicks = getAnimationDurationTicks(animation);
@@ -100,7 +124,12 @@ export class AnimationCanvasRenderer {
     }
     const frames: string[] = [];
     for (let tick = 0; tick < totalTicks; tick += 1) {
-      const canvas = await this.renderFrame(document, animationId, tick);
+      if (signal?.aborted) throw new Error(EXPORT_CANCELLED);
+      const canvas = await abortable(
+        this.renderFrame(document, animationId, tick),
+        signal,
+      );
+      if (signal?.aborted) throw new Error(EXPORT_CANCELLED);
       frames.push(canvas.toDataURL("image/png"));
     }
     return frames;

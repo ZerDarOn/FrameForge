@@ -1,9 +1,13 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useProjectStore } from "../../stores/projectStore";
 import { useTimelineStore } from "../../stores/timelineStore";
-import { AnimationCanvasRenderer } from "../../engines/animationCanvasRenderer";
+import {
+  AnimationCanvasRenderer,
+  EXPORT_CANCELLED,
+} from "../../engines/animationCanvasRenderer";
 import { useAnimationDocumentStore } from "../../stores/animationDocumentStore";
 import {
   chooseExportDestination,
@@ -16,18 +20,99 @@ interface Props {
   onClose: () => void;
 }
 
+interface Mp4ExportProgress {
+  operationId: string;
+  projectId: string;
+  stage: "preparing" | "encoding" | "committing";
+}
+
 export function ExportDialog({ onClose }: Props) {
   const project = useProjectStore((s) => s.project);
+  const initialProjectId = useState(() => project?.id ?? null)[0];
   const tracks = useTimelineStore((s) => s.tracks);
   const document = useAnimationDocumentStore((s) => s.document);
   const [format, setFormat] = useState<ExportFormat>("png_sequence");
   const [exporting, setExporting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [result, setResult] = useState<string | null>(null);
+  const activeOperationRef = useRef<string | null>(null);
+  const activeProjectRef = useRef<string | null>(null);
+  const activeFormatRef = useRef<ExportFormat | null>(null);
+  const phaseRef = useRef<"idle" | "rendering" | "writing">("idle");
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const mp4BackendReadyRef = useRef(false);
+  const cancelRequestedRef = useRef(false);
+  const cancelSentRef = useRef(false);
   const animation = document?.animations[0];
   const timing = document && animation ? getAnimationExportTiming(document) : null;
 
+  const sendMp4Cancellation = async (operationId: string, projectId: string) => {
+    if (cancelSentRef.current) return;
+    cancelSentRef.current = true;
+    try {
+      const accepted = await invoke<boolean>("cancel_rendered_mp4_export", {
+        operationId,
+        projectId,
+      });
+      if (!accepted && activeOperationRef.current === operationId) {
+        cancelRequestedRef.current = false;
+        cancelSentRef.current = false;
+        setCancelling(false);
+        setResult("MP4 已进入文件提交阶段，无法取消。");
+      }
+    } catch (cancelError) {
+      if (activeOperationRef.current !== operationId) return;
+      cancelRequestedRef.current = false;
+      cancelSentRef.current = false;
+      setCancelling(false);
+      const message = cancelError instanceof Error ? cancelError.message : String(cancelError);
+      setResult(`取消失败: ${message}`);
+    }
+  };
+
+  const handleCancel = () => {
+    if (!exporting) {
+      onClose();
+      return;
+    }
+    if (cancelling) return;
+    const operationId = activeOperationRef.current;
+    const projectId = activeProjectRef.current;
+    const activeFormat = activeFormatRef.current;
+    if (!operationId || !projectId || !activeFormat) return;
+    if (phaseRef.current === "writing" && activeFormat !== "mp4") {
+      setResult("文件已进入写入阶段，无法取消。");
+      return;
+    }
+
+    cancelRequestedRef.current = true;
+    setCancelling(true);
+    setResult(null);
+    abortControllerRef.current?.abort();
+    if (activeFormat === "mp4" && mp4BackendReadyRef.current) {
+      void sendMp4Cancellation(operationId, projectId);
+    }
+  };
+
+  useEffect(() => {
+    if (project?.id === initialProjectId) return;
+    cancelRequestedRef.current = true;
+    abortControllerRef.current?.abort();
+    const operationId = activeOperationRef.current;
+    const projectId = activeProjectRef.current;
+    if (
+      operationId &&
+      projectId &&
+      activeFormatRef.current === "mp4" &&
+      mp4BackendReadyRef.current
+    ) {
+      void sendMp4Cancellation(operationId, projectId);
+    }
+    onClose();
+  }, [initialProjectId, onClose, project?.id]);
+
   const handleExport = async () => {
-    if (!project) return;
+    if (!project || project.id !== initialProjectId) return;
     if (!document || !animation) {
       setResult("导出失败: 动画文档尚未就绪");
       return;
@@ -41,48 +126,94 @@ export function ExportDialog({ onClose }: Props) {
         saveDialog,
       );
       if (!selected) return;
+      const operationId = crypto.randomUUID();
+      const controller = new AbortController();
+      activeOperationRef.current = operationId;
+      activeProjectRef.current = project.id;
+      activeFormatRef.current = format;
+      phaseRef.current = "rendering";
+      abortControllerRef.current = controller;
+      mp4BackendReadyRef.current = false;
+      cancelRequestedRef.current = false;
+      cancelSentRef.current = false;
       setExporting(true);
+      setCancelling(false);
       setResult(null);
-      if (format === "png_sequence") {
-        const frames = await new AnimationCanvasRenderer().renderPngFrames(
-          document,
-          animation.id,
-        );
-        const count = await invoke<number>("write_rendered_png_sequence", {
-          operationId: crypto.randomUUID(),
-          outputDir: selected,
-          frames,
+      let unlisten: (() => void) | undefined;
+      if (format === "mp4") {
+        unlisten = await listen<Mp4ExportProgress>("mp4-export-progress", ({ payload }) => {
+          if (payload.operationId !== operationId || payload.projectId !== project.id) return;
+          mp4BackendReadyRef.current = true;
+          if (cancelRequestedRef.current) {
+            void sendMp4Cancellation(operationId, project.id);
+          }
         });
-        setResult(`成功导出 ${count} 帧到:\n${selected}`);
-      } else if (format === "gif") {
-        const frames = await new AnimationCanvasRenderer().renderPngFrames(
-          document,
-          animation.id,
-        );
-        const count = await invoke<number>("write_rendered_gif", {
-          operationId: crypto.randomUUID(),
-          outputPath: selected,
-          frameDelayMs: timing?.frameDelayMs ?? 1,
-          frames,
-        });
-        setResult(`成功导出 GIF（${count} 帧）到:\n${selected}`);
-      } else if (format === "mp4") {
-        const frames = await new AnimationCanvasRenderer().renderPngFrames(
-          document,
-          animation.id,
-        );
-        const count = await invoke<number>("write_rendered_mp4", {
-          operationId: crypto.randomUUID(),
-          outputPath: selected,
-          fps: timing?.fps ?? 1,
-          frames,
-        });
-        setResult(`成功导出 MP4（${count} 帧）到:\n${selected}`);
+      }
+      try {
+        if (format === "png_sequence") {
+          const frames = await new AnimationCanvasRenderer().renderPngFrames(
+            document,
+            animation.id,
+            controller.signal,
+          );
+          phaseRef.current = "writing";
+          const count = await invoke<number>("write_rendered_png_sequence", {
+            operationId,
+            outputDir: selected,
+            frames,
+          });
+          setResult(`成功导出 ${count} 帧到:\n${selected}`);
+        } else if (format === "gif") {
+          const frames = await new AnimationCanvasRenderer().renderPngFrames(
+            document,
+            animation.id,
+            controller.signal,
+          );
+          phaseRef.current = "writing";
+          const count = await invoke<number>("write_rendered_gif", {
+            operationId,
+            outputPath: selected,
+            frameDelayMs: timing?.frameDelayMs ?? 1,
+            frames,
+          });
+          setResult(`成功导出 GIF（${count} 帧）到:\n${selected}`);
+        } else if (format === "mp4") {
+          const frames = await new AnimationCanvasRenderer().renderPngFrames(
+            document,
+            animation.id,
+            controller.signal,
+          );
+          phaseRef.current = "writing";
+          const count = await invoke<number>("write_rendered_mp4", {
+            operationId,
+            projectId: project.id,
+            outputPath: selected,
+            fps: timing?.fps ?? 1,
+            frames,
+          });
+          setResult(`成功导出 MP4（${count} 帧）到:\n${selected}`);
+        }
+      } finally {
+        unlisten?.();
       }
     } catch (err) {
-      setResult(`导出失败: ${err instanceof Error ? err.message : String(err)}`);
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes(EXPORT_CANCELLED) || message.includes("MP4_EXPORT_CANCELLED")) {
+        onClose();
+      } else {
+        setResult(`导出失败: ${message}`);
+      }
     } finally {
+      activeOperationRef.current = null;
+      activeProjectRef.current = null;
+      activeFormatRef.current = null;
+      phaseRef.current = "idle";
+      abortControllerRef.current = null;
+      mp4BackendReadyRef.current = false;
+      cancelRequestedRef.current = false;
+      cancelSentRef.current = false;
       setExporting(false);
+      setCancelling(false);
     }
   };
 
@@ -133,17 +264,17 @@ export function ExportDialog({ onClose }: Props) {
         <div className="flex gap-3">
           <button
             className="flex-1 py-2 bg-gray-800 hover:bg-gray-700 rounded text-sm text-gray-300"
-            onClick={onClose}
-            disabled={exporting}
+            onClick={handleCancel}
+            disabled={cancelling}
           >
-            {result ? "关闭" : "取消"}
+            {cancelling ? "正在取消..." : result ? "关闭" : "取消"}
           </button>
           <button
             className="flex-1 py-2 bg-orange-600 hover:bg-orange-500 rounded text-sm font-medium text-white disabled:opacity-50"
             onClick={handleExport}
             disabled={exporting}
           >
-            {exporting ? "导出中..." : "导出"}
+            {cancelling ? "正在取消..." : exporting ? "导出中..." : "导出"}
           </button>
         </div>
       </div>

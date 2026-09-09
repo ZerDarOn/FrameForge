@@ -1,16 +1,137 @@
 use super::ffmpeg::resolve_ffmpeg_tool;
 use base64::Engine;
+use serde::Serialize;
 use std::{
+    collections::HashMap,
     io::{BufReader, BufWriter, Cursor, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
+    time::Duration,
 };
+use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_EXPORT_FRAMES: usize = 10_000;
 const MAX_DECODED_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EXPORT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_EXPORT_CANVAS_PIXELS: u64 = 16_777_216;
+const MP4_EXPORT_CANCELLED: &str = "MP4_EXPORT_CANCELLED";
+
+struct Mp4ExportRecord {
+    project_id: String,
+    cancellation: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+pub struct Mp4ExportRegistry {
+    operations: Mutex<HashMap<String, Mp4ExportRecord>>,
+}
+
+impl Mp4ExportRegistry {
+    fn register(&self, operation_id: &str, project_id: &str) -> Result<Arc<AtomicBool>, String> {
+        let mut operations = self
+            .operations
+            .lock()
+            .map_err(|error| format!("MP4 导出注册表锁定失败: {}", error))?;
+        if operations.contains_key(operation_id) {
+            return Err("MP4 导出 operationId 已存在".to_string());
+        }
+        let cancellation = Arc::new(AtomicBool::new(false));
+        operations.insert(
+            operation_id.to_string(),
+            Mp4ExportRecord {
+                project_id: project_id.to_string(),
+                cancellation: cancellation.clone(),
+            },
+        );
+        Ok(cancellation)
+    }
+
+    fn request_cancel(&self, operation_id: &str, project_id: &str) -> Result<bool, String> {
+        let operations = self
+            .operations
+            .lock()
+            .map_err(|error| format!("MP4 导出注册表锁定失败: {}", error))?;
+        let Some(record) = operations.get(operation_id) else {
+            return Ok(false);
+        };
+        if record.project_id != project_id {
+            return Ok(false);
+        }
+        record.cancellation.store(true, Ordering::Release);
+        Ok(true)
+    }
+
+    fn finish(&self, operation_id: &str, project_id: &str) -> bool {
+        let Ok(mut operations) = self.operations.lock() else {
+            log::error!("MP4 export registry lock poisoned while finishing");
+            return false;
+        };
+        let matches_project = operations
+            .get(operation_id)
+            .is_some_and(|record| record.project_id == project_id);
+        if !matches_project {
+            return false;
+        }
+        operations
+            .remove(operation_id)
+            .is_some_and(|record| !record.cancellation.load(Ordering::Acquire))
+    }
+}
+
+struct Mp4ExportRegistration<'a> {
+    registry: &'a Mp4ExportRegistry,
+    operation_id: String,
+    project_id: String,
+    cancellation: Arc<AtomicBool>,
+    active: bool,
+}
+
+impl<'a> Mp4ExportRegistration<'a> {
+    fn new(
+        registry: &'a Mp4ExportRegistry,
+        operation_id: &str,
+        project_id: &str,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            registry,
+            operation_id: operation_id.to_string(),
+            project_id: project_id.to_string(),
+            cancellation: registry.register(operation_id, project_id)?,
+            active: true,
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+    }
+
+    fn claim_commit(&mut self) -> bool {
+        let can_commit = self.registry.finish(&self.operation_id, &self.project_id);
+        self.active = false;
+        can_commit
+    }
+}
+
+impl Drop for Mp4ExportRegistration<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.registry.finish(&self.operation_id, &self.project_id);
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Mp4ExportProgress {
+    operation_id: String,
+    project_id: String,
+    stage: String,
+}
 
 fn decode_png_data_url(frame: &str) -> Result<Vec<u8>, String> {
     let encoded = frame
@@ -43,6 +164,18 @@ fn validate_operation_id(operation_id: &str) -> Result<(), String> {
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
     {
         return Err("导出 operationId 无效".to_string());
+    }
+    Ok(())
+}
+
+fn validate_project_id(project_id: &str) -> Result<(), String> {
+    if project_id.is_empty()
+        || project_id.len() > 128
+        || !project_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    {
+        return Err("MP4 导出 projectId 无效".to_string());
     }
     Ok(())
 }
@@ -226,26 +359,42 @@ pub fn write_rendered_gif(
 
 #[tauri::command]
 pub async fn write_rendered_mp4(
+    app: AppHandle,
     operation_id: String,
+    project_id: String,
     output_path: String,
     fps: u32,
     frames: Vec<String>,
 ) -> Result<usize, String> {
+    let state_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        write_rendered_mp4_blocking(operation_id, output_path, fps, frames)
+        let operations = state_app.state::<Mp4ExportRegistry>();
+        write_rendered_mp4_blocking(
+            operations,
+            &state_app,
+            operation_id,
+            project_id,
+            output_path,
+            fps,
+            frames,
+        )
     })
     .await
     .map_err(|error| format!("MP4 导出工作线程失败: {}", error))?
 }
 
 fn write_rendered_mp4_blocking(
+    operations: State<'_, Mp4ExportRegistry>,
+    app: &AppHandle,
     operation_id: String,
+    project_id: String,
     output_path: String,
     fps: u32,
     frames: Vec<String>,
 ) -> Result<usize, String> {
     validate_frame_count(&frames)?;
     validate_operation_id(&operation_id)?;
+    validate_project_id(&project_id)?;
     validate_mp4_fps(fps)?;
 
     let output = Path::new(&output_path);
@@ -257,6 +406,15 @@ fn write_rendered_mp4_blocking(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("MP4 输出路径无效")?;
+    let mut registration = Mp4ExportRegistration::new(&operations, &operation_id, &project_id)?;
+    let _ = app.emit(
+        "mp4-export-progress",
+        Mp4ExportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "preparing".to_string(),
+        },
+    );
 
     let staging_directory = output_parent.join(format!(".frameforge-{}-mp4", operation_id));
     let staging = create_mp4_staging(staging_directory)?;
@@ -271,6 +429,14 @@ fn write_rendered_mp4_blocking(
     let mut total_bytes = 0_u64;
     let mut dimensions = None;
     for (index, frame) in frames.iter().enumerate() {
+        if registration.is_cancelled() {
+            log::info!(
+                "rendered MP4 export cancelled: operation_id={}, project_id={}, stage=preparing",
+                operation_id,
+                project_id
+            );
+            return Err(MP4_EXPORT_CANCELLED.to_string());
+        }
         let bytes = decode_png_data_url(frame)?;
         total_bytes = total_bytes
             .checked_add(bytes.len() as u64)
@@ -292,6 +458,14 @@ fn write_rendered_mp4_blocking(
     }
 
     let ffmpeg = resolve_ffmpeg_tool("ffmpeg")?;
+    let _ = app.emit(
+        "mp4-export-progress",
+        Mp4ExportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "encoding".to_string(),
+        },
+    );
     let encoded_path = staging.directory.join("rendered.mp4");
     let input_pattern = staging.directory.join("frame_%05d.png");
     let mut child = Command::new(ffmpeg)
@@ -330,13 +504,27 @@ fn write_rendered_mp4_blocking(
             return Err("无法读取 FFmpeg MP4 错误输出".to_string());
         }
     };
-    let status = match child.wait() {
-        Ok(status) => status,
-        Err(error) => {
+    let status = loop {
+        if registration.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
             let _ = stderr_reader.join();
-            return Err(format!("等待 FFmpeg MP4 编码失败: {}", error));
+            log::info!(
+                "rendered MP4 export cancelled: operation_id={}, project_id={}, stage=encoding",
+                operation_id,
+                project_id
+            );
+            return Err(MP4_EXPORT_CANCELLED.to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(format!("等待 FFmpeg MP4 编码失败: {}", error));
+            }
         }
     };
     let stderr = stderr_reader.join().unwrap_or_default();
@@ -354,6 +542,23 @@ fn write_rendered_mp4_blocking(
             format!("FFmpeg MP4 编码失败: {}", details)
         });
     }
+
+    if !registration.claim_commit() {
+        log::info!(
+            "rendered MP4 export cancelled: operation_id={}, project_id={}, stage=before_commit",
+            operation_id,
+            project_id
+        );
+        return Err(MP4_EXPORT_CANCELLED.to_string());
+    }
+    let _ = app.emit(
+        "mp4-export-progress",
+        Mp4ExportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "committing".to_string(),
+        },
+    );
 
     let backup_path = output_parent.join(format!(".frameforge-{}-previous.mp4", operation_id));
     let had_previous_output = output.exists();
@@ -401,9 +606,27 @@ fn write_rendered_mp4_blocking(
     Ok(frames.len())
 }
 
+#[tauri::command]
+pub fn cancel_rendered_mp4_export(
+    operations: State<'_, Mp4ExportRegistry>,
+    operation_id: String,
+    project_id: String,
+) -> Result<bool, String> {
+    validate_operation_id(&operation_id)?;
+    validate_project_id(&project_id)?;
+    let accepted = operations.request_cancel(&operation_id, &project_id)?;
+    log::info!(
+        "rendered MP4 export cancellation requested: operation_id={}, project_id={}, accepted={}",
+        operation_id,
+        project_id,
+        accepted
+    );
+    Ok(accepted)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{create_mp4_staging, validate_mp4_fps};
+    use super::{create_mp4_staging, validate_mp4_fps, Mp4ExportRegistry};
 
     #[test]
     fn mp4_export_rejects_unsafe_frame_rates() {
@@ -428,5 +651,30 @@ mod tests {
 
         std::fs::remove_file(sentinel).expect("remove sentinel");
         std::fs::remove_dir(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn mp4_cancellation_is_scoped_and_closes_before_commit() {
+        let operations = Mp4ExportRegistry::default();
+        let cancellation = operations
+            .register("operation-a", "project-a")
+            .expect("register");
+
+        assert!(!operations
+            .request_cancel("operation-a", "project-b")
+            .expect("wrong project"));
+        assert!(!cancellation.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(operations
+            .request_cancel("operation-a", "project-a")
+            .expect("matching project"));
+        assert!(!operations.finish("operation-a", "project-a"));
+
+        operations
+            .register("operation-b", "project-a")
+            .expect("register active export");
+        assert!(operations.finish("operation-b", "project-a"));
+        assert!(!operations
+            .request_cancel("operation-b", "project-a")
+            .expect("late cancellation"));
     }
 }

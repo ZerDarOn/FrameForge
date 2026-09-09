@@ -182,3 +182,23 @@ test("project switch does not reuse a same-id image from the previous project", 
   await first;
   assert.equal(target.content, "data:project-two");
 });
+
+test("PNG frame rendering aborts without waiting for a pending image", async () => {
+  FakeImage.instances = [];
+  Object.assign(globalThis, {
+    Image: FakeImage,
+    window: { document: { createElement: () => new FakeCanvas() } },
+  });
+  const renderer = new AnimationCanvasRenderer();
+  const controller = new AbortController();
+  const rendering = renderer.renderPngFrames(
+    renderDocument(),
+    "animation",
+    controller.signal,
+  );
+
+  assert.equal(FakeImage.instances.length, 1);
+  controller.abort();
+  await assert.rejects(rendering, /EXPORT_CANCELLED/);
+  assert.equal(FakeImage.instances.length, 1);
+});

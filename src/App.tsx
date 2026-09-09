@@ -22,6 +22,7 @@ import { WelcomeDialog } from "./components/dialogs/WelcomeDialog";
 import { ProjectSettingsDialog } from "./components/dialogs/ProjectSettingsDialog";
 import { SpriteSheetImportDialog } from "./components/dialogs/SpriteSheetImportDialog";
 import { GifImportDialog } from "./components/dialogs/GifImportDialog";
+import { VideoImportDialog } from "./components/dialogs/VideoImportDialog";
 
 export default function App() {
   const project = useProjectStore((s) => s.project);
@@ -37,6 +38,7 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showSpriteSheetImport, setShowSpriteSheetImport] = useState(false);
   const [showGifImport, setShowGifImport] = useState(false);
+  const [showVideoImport, setShowVideoImport] = useState(false);
 
   useKeyboardShortcuts();
   useUnsavedChangesGuard();
@@ -63,15 +65,20 @@ export default function App() {
     const showGifImportHandler = () => {
       if (useProjectStore.getState().loadStatus === "ready") setShowGifImport(true);
     };
+    const showVideoImportHandler = () => {
+      if (useProjectStore.getState().loadStatus === "ready") setShowVideoImport(true);
+    };
     window.addEventListener("frameforge:show-welcome", showWelcomeHandler);
     window.addEventListener("frameforge:show-settings", showSettingsHandler);
     window.addEventListener("frameforge:import-sprite-sheet", showSpriteSheetImportHandler);
     window.addEventListener("frameforge:import-gif", showGifImportHandler);
+    window.addEventListener("frameforge:import-video", showVideoImportHandler);
     return () => {
       window.removeEventListener("frameforge:show-welcome", showWelcomeHandler);
       window.removeEventListener("frameforge:show-settings", showSettingsHandler);
       window.removeEventListener("frameforge:import-sprite-sheet", showSpriteSheetImportHandler);
       window.removeEventListener("frameforge:import-gif", showGifImportHandler);
+      window.removeEventListener("frameforge:import-video", showVideoImportHandler);
     };
   }, []);
 
@@ -96,6 +103,10 @@ export default function App() {
 
         {showGifImport && project && loadStatus === "ready" && (
           <GifImportDialog onClose={() => setShowGifImport(false)} />
+        )}
+
+        {showVideoImport && project && loadStatus === "ready" && (
+          <VideoImportDialog onClose={() => setShowVideoImport(false)} />
         )}
 
         {project && loadStatus !== "ready" && (

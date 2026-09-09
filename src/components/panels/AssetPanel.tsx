@@ -117,6 +117,10 @@ export function AssetPanel() {  const tab = useUIStore((s) => s.sidebarTab);
             onClick={() => window.dispatchEvent(new CustomEvent("frameforge:import-gif"))}>
             导入 GIF
           </button>
+          <button className="w-full py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+            onClick={() => window.dispatchEvent(new CustomEvent("frameforge:import-video"))}>
+            导入视频
+          </button>
         </div>
       )}
     </div>

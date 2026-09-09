@@ -199,16 +199,24 @@ function TransformInfo({ asset }: { asset: any }) {
 function BaselineInfo() {
   const points = useBaselineStore((s) => s.points);
   const activePointId = useBaselineStore((s) => s.activePointId);
+  const persistenceError = useBaselineStore((s) => s.error);
   const setActivePoint = useBaselineStore((s) => s.setActivePoint);
   const removePoint = useBaselineStore((s) => s.removePoint);
   const markerType = useBaselineStore((s) => s.markerType);
   const setMarkerType = useBaselineStore((s) => s.setMarkerType);
+  const persist = useBaselineStore((s) => s.persist);
+  const projectId = useProjectStore((s) => s.project?.id);
   const viewportTool = useUIStore((s) => s.viewportTool);
   const setViewportTool = useUIStore((s) => s.setViewportTool);
   const isMarkerMode = viewportTool === "baseline";
 
   return (
     <div className="space-y-3">
+      {persistenceError && (
+        <div className="rounded border border-red-800/60 bg-red-950/40 px-2 py-2 text-[10px] text-red-300">
+          基准点保存失败：{persistenceError}
+        </div>
+      )}
       <div>
         <div className="text-gray-400 font-medium text-xs mb-2">标记工具</div>
         <div className="flex gap-1 mb-2">
@@ -248,7 +256,16 @@ function BaselineInfo() {
                 <span className="text-xs text-gray-300 flex-1 truncate">{p.name}</span>
                 <span className="text-[10px] text-gray-600">帧{p.frameIndex}</span>
                 <span className="text-[10px] text-gray-600">{p.type}</span>
-                <button className="text-[10px] text-red-500 hover:text-red-400" onClick={() => removePoint(p.id)}>✕</button>
+                <button
+                  className="text-[10px] text-red-500 hover:text-red-400"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    removePoint(p.id);
+                    if (projectId) void persist(projectId);
+                  }}
+                >
+                  ✕
+                </button>
               </div>
             ))}
           </div>

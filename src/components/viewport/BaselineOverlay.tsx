@@ -117,6 +117,8 @@ export function BaselineOverlay({ imageRect }: Props) {
     (e: React.MouseEvent) => {
       if (draggingPointId) {
         setDraggingPointId(null);
+        const projectId = useProjectStore.getState().project?.id;
+        if (projectId) void useBaselineStore.getState().persist(projectId);
         return;
       }
 
@@ -171,6 +173,8 @@ export function BaselineOverlay({ imageRect }: Props) {
       e.preventDefault();
       if (activePointId) {
         removePoint(activePointId);
+        const projectId = useProjectStore.getState().project?.id;
+        if (projectId) void useBaselineStore.getState().persist(projectId);
       }
     },
     [isMarkerMode, activePointId, removePoint]

@@ -4,6 +4,7 @@ import type { BaselinePoint, BaselineType } from "../types/baseline";
 
 interface BaselineState {
   points: BaselinePoint[];
+  error: string | null;
   activePointId: string | null;
   isMarkerMode: boolean;
   markerType: BaselineType;
@@ -24,11 +25,12 @@ const COLORS = ["#f97316", "#22c55e", "#3b82f6", "#ef4444", "#a855f7", "#eab308"
 
 export const useBaselineStore = create<BaselineState>((set, get) => ({
   points: [],
+  error: null,
   activePointId: null,
   isMarkerMode: false,
   markerType: "point",
 
-  setPoints: (points) => set({ points }),
+  setPoints: (points) => set({ points, error: null }),
   addPoint: (point) => {
     set((s) => ({ points: [...s.points, point] }));
   },
@@ -46,7 +48,7 @@ export const useBaselineStore = create<BaselineState>((set, get) => ({
   setActivePoint: (id) => set({ activePointId: id }),
   setMarkerMode: (active) => set({ isMarkerMode: active }),
   setMarkerType: (type) => set({ markerType: type }),
-  clearAll: () => set({ points: [], activePointId: null }),
+  clearAll: () => set({ points: [], activePointId: null, error: null }),
 
   persist: async (projectId) => {
     const points = get().points;
@@ -55,12 +57,29 @@ export const useBaselineStore = create<BaselineState>((set, get) => ({
         projectId,
         pointsJson: JSON.stringify(points),
       });
+      set({ error: null });
     } catch (err) {
-      console.error("持久化基准点失败:", err);
+      const message = err instanceof Error ? err.message : String(err);
+      set({ error: message });
+      console.error("[FrameForge] baseline persistence failed", {
+        projectId,
+        pointCount: points.length,
+        error: message,
+      });
     }
   },
 }));
 
 export function getNextColor(index: number): string {
   return COLORS[index % COLORS.length];
+}
+
+export type StoredBaselinePoint = Omit<BaselinePoint, "color">;
+
+export function restoreBaselinePoints(points: StoredBaselinePoint[]): BaselinePoint[] {
+  return points.map((point, index) => ({
+    ...point,
+    coordinates: [...point.coordinates],
+    color: getNextColor(index),
+  }));
 }

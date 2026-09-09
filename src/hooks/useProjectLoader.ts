@@ -3,6 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore } from "../stores/projectStore";
 import { useTimelineStore } from "../stores/timelineStore";
 import { useAnimationDocumentStore } from "../stores/animationDocumentStore";
+import {
+  restoreBaselinePoints,
+  useBaselineStore,
+  type StoredBaselinePoint,
+} from "../stores/baselineStore";
 import type { Track } from "../types/timeline";
 import {
   projectSessionController,
@@ -22,24 +27,31 @@ export function useProjectLoader() {
   const setFps = useTimelineStore((s) => s.setFps);
   const loadAnimationDocument = useAnimationDocumentStore((s) => s.loadForProject);
   const beginProjectLoad = useAnimationDocumentStore((s) => s.beginProjectLoad);
+  const setBaselinePoints = useBaselineStore((s) => s.setPoints);
 
   useEffect(() => {
-    if (!projectId) return;
+    if (!projectId) {
+      setBaselinePoints([]);
+      return;
+    }
     const projectSnapshot = useProjectStore.getState().project;
     if (!projectSnapshot || projectSnapshot.id !== projectId) return;
     const token: ProjectSessionToken = { projectId, sessionId };
     let cancelled = false;
     beginProjectLoad();
     setTracks([]);
+    setBaselinePoints([]);
     useTimelineStore.getState().setPlaying(false);
 
     const loadProjectData = async () => {
       try {
-        const tracks = await invoke<Track[]>("get_project_tracks", {
-          projectId,
-        });
+        const [tracks, baselinePoints] = await Promise.all([
+          invoke<Track[]>("get_project_tracks", { projectId }),
+          invoke<StoredBaselinePoint[]>("get_baseline_points", { projectId }),
+        ]);
         if (cancelled || !projectSessionController.isCurrent(token)) return;
         setTracks(tracks);
+        setBaselinePoints(restoreBaselinePoints(baselinePoints));
         setFps(projectSnapshot.fps);
         const loaded = await loadAnimationDocument(projectSnapshot, tracks);
         if (cancelled || !projectSessionController.isCurrent(token)) return;
@@ -69,6 +81,7 @@ export function useProjectLoader() {
     projectId,
     sessionId,
     setFps,
+    setBaselinePoints,
     setTracks,
   ]);
 }

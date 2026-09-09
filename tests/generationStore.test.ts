@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createGenerationStore } from "../src/stores/generationStore.ts";
-import type { GeneratedAsset, TextToPixelParams } from "../src/types/generation.ts";
+import {
+  createGenerationStore,
+  type GenerationRetryStorage,
+} from "../src/stores/generationStore.ts";
+import type {
+  GeneratedAsset,
+  GenerationJob,
+  TextToPixelParams,
+} from "../src/types/generation.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -37,6 +44,18 @@ function asset(id: string, projectId: string): GeneratedAsset {
     thumbnailPath: `C:/generated/thumb-${id}.png`,
     createdAt: 1,
   };
+}
+
+function memoryRetryStorage() {
+  const snapshots = new Map<string, GenerationJob>();
+  const storage: GenerationRetryStorage = {
+    load: (projectId) => snapshots.get(projectId) ?? null,
+    save: (job) => snapshots.set(job.projectId, structuredClone(job)),
+    clear: (projectId) => {
+      snapshots.delete(projectId);
+    },
+  };
+  return { snapshots, storage };
 }
 
 test("project switch ignores stale generation progress and results", async () => {
@@ -140,4 +159,80 @@ test("failed generation retries from an immutable parameter snapshot", async () 
     (generateArgs[1].params as TextToPixelParams).prompt,
     "idle hero",
   );
+});
+
+test("retryable generation snapshot restores per project and clears after success", async () => {
+  const { snapshots, storage } = memoryRetryStorage();
+  const firstStore = createGenerationStore(
+    async <T>(command: string) => {
+      if (command === "list_generated_assets") return [] as T;
+      if (command === "generate_pixel_art") throw new Error("provider unavailable");
+      throw new Error(`unexpected command: ${command}`);
+    },
+    () => "job-failed",
+    storage,
+  );
+
+  await firstStore.getState().loadAssets("project-a");
+  await firstStore.getState().generate("project-a", params);
+  assert.equal(snapshots.get("project-a")?.status, "failed");
+
+  const generateArgs: Record<string, unknown>[] = [];
+  const restoredStore = createGenerationStore(
+    async <T>(command: string, args?: Record<string, unknown>) => {
+      if (command === "list_generated_assets") return [] as T;
+      if (command === "generate_pixel_art") {
+        generateArgs.push(args ?? {});
+        return [asset("candidate-restored", "project-a")] as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    },
+    () => "job-restored",
+    storage,
+  );
+
+  await restoredStore.getState().loadAssets("project-a");
+  assert.equal(restoredStore.getState().activeJob?.id, "job-failed");
+  assert.equal(restoredStore.getState().activeJob?.status, "failed");
+  assert.equal(restoredStore.getState().error, "provider unavailable");
+
+  await restoredStore.getState().retryActiveJob();
+
+  assert.equal(restoredStore.getState().activeJob?.status, "completed");
+  assert.equal(restoredStore.getState().assets[0]?.id, "candidate-restored");
+  assert.equal(
+    (generateArgs[0].params as TextToPixelParams).prompt,
+    params.prompt,
+  );
+  assert.equal(snapshots.has("project-a"), false);
+});
+
+test("cancelled progress rejects a late successful result and keeps retry context", async () => {
+  const generation = deferred<GeneratedAsset[]>();
+  const { snapshots, storage } = memoryRetryStorage();
+  const store = createGenerationStore(
+    async <T>(command: string) => {
+      if (command === "list_generated_assets") return [] as T;
+      if (command === "generate_pixel_art") return generation.promise as Promise<T>;
+      throw new Error(`unexpected command: ${command}`);
+    },
+    () => "job-late-result",
+    storage,
+  );
+
+  await store.getState().loadAssets("project-a");
+  const running = store.getState().generate("project-a", params);
+  store.getState().handleProgress({
+    jobId: "job-late-result",
+    projectId: "project-a",
+    stage: "cancelled",
+    current: 0,
+    total: 1,
+  });
+  generation.resolve([asset("candidate-too-late", "project-a")]);
+  await running;
+
+  assert.equal(store.getState().activeJob?.status, "cancelled");
+  assert.deepEqual(store.getState().assets, []);
+  assert.equal(snapshots.get("project-a")?.status, "cancelled");
 });

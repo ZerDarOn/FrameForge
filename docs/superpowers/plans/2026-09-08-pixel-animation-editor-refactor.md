@@ -193,3 +193,6 @@ P1 首要交付：移动一帧、延长停留、删除再撤销、关闭重开�
 - 2026-09-09（Rust 阻塞复验）：保持 Smart App Control 与其他系统安全设置不变，通过 `vcvars64.bat` 初始化工具链后，`cargo check --tests` 成功，随后 `cargo test --lib` 可正常构建并执行；当时 7/7 Rust 单测通过。此前 OS error 4551 未再复现，因此不再把它列为当前阻塞，但也不将一次成功推断为策略已永久放行。
 - 2026-09-09（P3.2 第三切片）：生成任务注册表现在为每个 jobId/projectId 创建独立取消信号，OpenAI 与 Stability 的请求 Future 与取消信号通过有偏选择共同等待；取消已到达时优先返回 `GENERATION_CANCELLED` 并丢弃正在进行的请求，避免继续占用连接或消耗后续处理。新增关键路径日志只记录任务、项目、供应商和候选序号，不记录提示词、响应正文或密钥。
 - 2026-09-09（P3.2 最新验证）：新增 Rust 回归测试覆盖挂起请求在取消后被丢弃，以及取消与成功同时就绪时取消优先；`cargo test --lib` 9/9、`npm run test:core` 64/64、`npm run build` 均通过。未调用真实付费生成接口，Tauri 桌面交互和真实供应商网络中止仍待人工集成验收。
+- 2026-09-09（FFmpeg 工具准备）：从 FFmpeg 官方 Windows 下载页列出的 gyan.dev 获取 9.0.1 essentials ZIP，SHA-256 与发布值 `fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9` 一致；解压到 `D:\Tools\ffmpeg`，并设置用户级 `FRAMEFORGE_FFMPEG_DIR=D:\Tools\ffmpeg\bin`，未写入 C 盘或修改全局 PATH。
+- 2026-09-09（P3.1 第三切片后端）：新增视频信息检查和按起止秒数/抽帧 FPS 导入命令。后端限制输入 4 GiB、轨道与输出画布 16M 像素、单次 10000 帧和输出 1 GiB；抽帧 FPS 不得高于项目 FPS，以累计 tick 量化保留片段时长且避免画格重叠。ffprobe/ffmpeg 均通过参数数组调用，不经过 shell；所有 PNG 写入 operation 独立目录并验证后，才复用单个 SQLite 事务创建轨道，失败清理本次文件且保留原视频。
+- 2026-09-09（视频后端验证）：Rust 测试新增范围/FPS 时间规划、上限与 ffprobe 流时长 `N/A` 回退覆盖，`cargo test --lib` 12/12 通过。另用 FFmpeg 自生成 64×32、10 fps、2 秒测试视频，以实际后端参数从 0.5–1.5 秒按 5 fps 抽取，得到 5 张 64×32 PNG；首次输出侧定位仅得到 4 帧的问题已据此改为输入侧精确定位。前端视频导入对话框仍待下一切片。

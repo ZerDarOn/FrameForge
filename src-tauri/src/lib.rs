@@ -47,6 +47,8 @@ pub fn run() {
             commands::asset::import_files_to_new_track,
             commands::asset::slice_sprite_sheet_to_new_track,
             commands::asset::import_gif_to_new_track,
+            commands::asset::inspect_video_file,
+            commands::asset::import_video_to_new_track,
             commands::asset::extract_asset_to_new_track,
             commands::asset::import_frames_to_track,
             commands::asset::get_project_tracks,

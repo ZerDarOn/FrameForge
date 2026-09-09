@@ -2,7 +2,12 @@ use crate::db::DbState;
 use image::{AnimationDecoder, ImageDecoder};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::BufReader, path::Path};
+use std::{
+    fs::File,
+    io::BufReader,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_SPRITE_SHEET_FRAMES: usize = 10_000;
@@ -11,6 +16,11 @@ const MAX_GIF_FRAMES: usize = 10_000;
 const MAX_GIF_CANVAS_PIXELS: u64 = 16_777_216;
 const MAX_GIF_DECODED_PIXELS: u64 = 268_435_456;
 const MAX_GIF_OUTPUT_BYTES: u64 = 1_073_741_824;
+const MAX_VIDEO_FRAMES: usize = 10_000;
+const MAX_VIDEO_CANVAS_PIXELS: u64 = 16_777_216;
+const MAX_VIDEO_INPUT_BYTES: u64 = 4_294_967_296;
+const MAX_VIDEO_OUTPUT_BYTES: u64 = 1_073_741_824;
+const FFMPEG_DIRECTORY_ENV: &str = "FRAMEFORGE_FFMPEG_DIR";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +69,33 @@ pub struct ImageFileInfo {
     pub height: u32,
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoFileInfo {
+    pub width: u32,
+    pub height: u32,
+    pub duration_seconds: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct VideoProbeOutput {
+    #[serde(default)]
+    streams: Vec<VideoProbeStream>,
+    format: Option<VideoProbeFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VideoProbeStream {
+    width: Option<u32>,
+    height: Option<u32>,
+    duration: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VideoProbeFormat {
+    duration: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SpriteSheetImportProgress {
@@ -79,14 +116,31 @@ struct GifImportProgress {
     total: Option<usize>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoImportProgress {
+    operation_id: String,
+    project_id: String,
+    stage: String,
+    completed: usize,
+    total: Option<usize>,
+}
+
 #[derive(Debug)]
-struct PreparedGifFrame {
+struct PreparedImportedFrame {
     path: String,
     width: i64,
     height: i64,
     start_frame: i64,
     duration_frames: i64,
     source_timestamp: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VideoFrameTiming {
+    source_timestamp: i64,
+    start_frame: i64,
+    duration_frames: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +159,173 @@ fn gif_delay_to_ticks(numerator_ms: u32, denominator: u32, fps: i64) -> i64 {
     let scaled_numerator = u64::from(numerator_ms) * fps as u64;
     let scaled_denominator = u64::from(denominator) * 1_000;
     ((scaled_numerator + scaled_denominator / 2) / scaled_denominator).max(1) as i64
+}
+
+fn plan_video_frame_timing(
+    start_seconds: f64,
+    end_seconds: f64,
+    sample_fps: f64,
+    project_fps: i64,
+) -> Result<Vec<VideoFrameTiming>, String> {
+    if !start_seconds.is_finite()
+        || !end_seconds.is_finite()
+        || !sample_fps.is_finite()
+        || start_seconds < 0.0
+        || end_seconds <= start_seconds
+    {
+        return Err("视频抽帧范围无效".to_string());
+    }
+    if !(1..=240).contains(&project_fps) || sample_fps <= 0.0 || sample_fps > project_fps as f64 {
+        return Err("抽帧帧率必须大于 0 且不高于项目帧率".to_string());
+    }
+
+    let duration_seconds = end_seconds - start_seconds;
+    let expected_frames = duration_seconds * sample_fps;
+    if !expected_frames.is_finite() || expected_frames <= 0.0 {
+        return Err("视频抽帧范围内没有可导入帧".to_string());
+    }
+    let frame_count = expected_frames.ceil() as usize;
+    if frame_count > MAX_VIDEO_FRAMES {
+        return Err(format!("视频抽帧不能超过 {} 帧", MAX_VIDEO_FRAMES));
+    }
+
+    let mut timing = Vec::with_capacity(frame_count);
+    for index in 0..frame_count {
+        let source_offset_seconds = index as f64 / sample_fps;
+        let next_source_offset_seconds = ((index + 1) as f64 / sample_fps).min(duration_seconds);
+        let start_frame = (source_offset_seconds * project_fps as f64).round() as i64;
+        let end_frame = (next_source_offset_seconds * project_fps as f64).round() as i64;
+        timing.push(VideoFrameTiming {
+            source_timestamp: ((start_seconds + source_offset_seconds) * 1_000.0).round() as i64,
+            start_frame,
+            duration_frames: (end_frame - start_frame).max(1),
+        });
+    }
+    Ok(timing)
+}
+
+fn parse_video_probe(output: &str) -> Result<VideoFileInfo, String> {
+    let probe: VideoProbeOutput =
+        serde_json::from_str(output).map_err(|error| format!("解析视频信息失败: {}", error))?;
+    let stream = probe
+        .streams
+        .first()
+        .ok_or_else(|| "视频中没有可用的视频轨道".to_string())?;
+    let width = stream
+        .width
+        .ok_or_else(|| "视频轨道缺少宽度信息".to_string())?;
+    let height = stream
+        .height
+        .ok_or_else(|| "视频轨道缺少高度信息".to_string())?;
+    let parse_duration = |value: &str| {
+        value
+            .parse::<f64>()
+            .ok()
+            .filter(|duration| duration.is_finite() && *duration > 0.0)
+    };
+    let duration_seconds = stream
+        .duration
+        .as_deref()
+        .and_then(parse_duration)
+        .or_else(|| {
+            probe
+                .format
+                .as_ref()
+                .and_then(|format| format.duration.as_deref())
+                .and_then(parse_duration)
+        })
+        .ok_or_else(|| "视频缺少有效时长信息".to_string())?;
+    let canvas_pixels = u64::from(width) * u64::from(height);
+    if width == 0 || height == 0 || canvas_pixels > MAX_VIDEO_CANVAS_PIXELS {
+        return Err("视频尺寸或时长超出安全范围".to_string());
+    }
+    Ok(VideoFileInfo {
+        width,
+        height,
+        duration_seconds,
+    })
+}
+
+fn resolve_ffmpeg_tool(tool_name: &str) -> Result<PathBuf, String> {
+    let executable_name = if cfg!(windows) {
+        format!("{}.exe", tool_name)
+    } else {
+        tool_name.to_string()
+    };
+    if let Ok(directory) = std::env::var(FFMPEG_DIRECTORY_ENV) {
+        let candidate = PathBuf::from(directory).join(&executable_name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    let path_candidate = PathBuf::from(&executable_name);
+    let available_on_path = Command::new(&path_candidate)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if available_on_path {
+        return Ok(path_candidate);
+    }
+
+    Err(format!(
+        "未找到 {}。请安装 FFmpeg，并将 {} 设置为包含 ffmpeg 与 ffprobe 的目录",
+        tool_name, FFMPEG_DIRECTORY_ENV
+    ))
+}
+
+fn bounded_process_error(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .trim()
+        .chars()
+        .take(512)
+        .collect()
+}
+
+fn inspect_video_path(source_path: &str) -> Result<VideoFileInfo, String> {
+    let metadata =
+        std::fs::metadata(source_path).map_err(|error| format!("读取视频失败: {}", error))?;
+    if !metadata.is_file() || metadata.len() > MAX_VIDEO_INPUT_BYTES {
+        return Err("视频必须是小于 4 GiB 的文件".to_string());
+    }
+
+    let ffprobe = resolve_ffmpeg_tool("ffprobe")?;
+    let output = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,duration:format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(source_path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("启动 ffprobe 失败: {}", error))?;
+    if !output.status.success() {
+        let details = bounded_process_error(&output.stderr);
+        return Err(if details.is_empty() {
+            "ffprobe 无法读取视频".to_string()
+        } else {
+            format!("ffprobe 无法读取视频: {}", details)
+        });
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| "ffprobe 返回了无效的 UTF-8 数据".to_string())?;
+    parse_video_probe(&stdout)
+}
+
+#[tauri::command]
+pub async fn inspect_video_file(source_path: String) -> Result<VideoFileInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_video_path(&source_path))
+        .await
+        .map_err(|error| format!("视频检查工作线程失败: {}", error))?
 }
 
 fn plan_sprite_sheet_slices(
@@ -638,26 +859,27 @@ fn slice_sprite_sheet_to_new_track_blocking(
     result
 }
 
-fn cleanup_gif_output(file_paths: &[String], output_dir: &Path) {
+fn cleanup_import_output(file_paths: &[String], output_dir: &Path, import_kind: &str) {
     for file_path in file_paths {
         if let Err(error) = std::fs::remove_file(file_path) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("gif frame cleanup failed");
+                log::warn!("{} frame cleanup failed", import_kind);
             }
         }
     }
     if let Err(error) = std::fs::remove_dir(output_dir) {
         if error.kind() != std::io::ErrorKind::NotFound {
-            log::warn!("gif output directory cleanup failed");
+            log::warn!("{} output directory cleanup failed", import_kind);
         }
     }
 }
 
-fn commit_gif_frames_to_new_track(
+fn commit_imported_frames_to_new_track(
     db: State<'_, DbState>,
     project_id: &str,
     name: &str,
-    frames: &[PreparedGifFrame],
+    frames: &[PreparedImportedFrame],
+    frame_name_prefix: &str,
 ) -> Result<TrackInfo, String> {
     let track_id = uuid::Uuid::new_v4().to_string();
     let assets: Vec<AssetInfo> = frames
@@ -666,7 +888,7 @@ fn commit_gif_frames_to_new_track(
         .map(|(index, frame)| AssetInfo {
             id: uuid::Uuid::new_v4().to_string(),
             track_id: track_id.clone(),
-            name: format!("GIF 帧 {}", index + 1),
+            name: format!("{} {}", frame_name_prefix, index + 1),
             source_type: "image".to_string(),
             source_path: frame.path.clone(),
             thumbnail_path: frame.path.clone(),
@@ -691,16 +913,16 @@ fn commit_gif_frames_to_new_track(
         .map_err(|error| format!("数据库锁失败: {}", error))?;
     let tx = conn
         .transaction()
-        .map_err(|error| format!("开始 GIF 导入事务失败: {}", error))?;
+        .map_err(|error| format!("开始动画帧导入事务失败: {}", error))?;
     let project_exists: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
             params![project_id],
             |row| row.get(0),
         )
-        .map_err(|error| format!("检查 GIF 导入项目失败: {}", error))?;
+        .map_err(|error| format!("检查动画帧导入项目失败: {}", error))?;
     if !project_exists {
-        return Err("GIF 导入目标项目不存在".to_string());
+        return Err("动画帧导入目标项目不存在".to_string());
     }
     let track_order: i64 = tx
         .query_row(
@@ -708,13 +930,13 @@ fn commit_gif_frames_to_new_track(
             params![project_id],
             |row| row.get(0),
         )
-        .map_err(|error| format!("读取 GIF 轨道顺序失败: {}", error))?;
+        .map_err(|error| format!("读取动画帧轨道顺序失败: {}", error))?;
     tx.execute(
         "INSERT INTO tracks (id, project_id, name, type, visible, locked, opacity, track_order)
          VALUES (?1, ?2, ?3, 'image_sequence', 1, 0, 1.0, ?4)",
         params![&track_id, project_id, name, track_order],
     )
-    .map_err(|error| format!("创建 GIF 轨道失败: {}", error))?;
+    .map_err(|error| format!("创建动画帧轨道失败: {}", error))?;
     for asset in &assets {
         tx.execute(
             "INSERT INTO assets (id, track_id, name, source_type, source_path, thumbnail_path, start_frame, duration_frames, width, height, matched_fps, source_timestamp)
@@ -732,10 +954,10 @@ fn commit_gif_frames_to_new_track(
                 asset.source_timestamp,
             ],
         )
-        .map_err(|error| format!("写入 GIF 画格失败: {}", error))?;
+        .map_err(|error| format!("写入动画画格失败: {}", error))?;
     }
     tx.commit()
-        .map_err(|error| format!("提交 GIF 导入事务失败: {}", error))?;
+        .map_err(|error| format!("提交动画帧导入事务失败: {}", error))?;
 
     Ok(TrackInfo {
         id: track_id,
@@ -900,7 +1122,7 @@ fn import_gif_to_new_track_blocking(
                 return Err("GIF 解码后的文件总量超过 1 GiB".to_string());
             }
 
-            prepared_frames.push(PreparedGifFrame {
+            prepared_frames.push(PreparedImportedFrame {
                 path: output_path_string,
                 width: i64::from(width),
                 height: i64::from(height),
@@ -941,7 +1163,13 @@ fn import_gif_to_new_track_blocking(
                 total: Some(prepared_frames.len()),
             },
         );
-        commit_gif_frames_to_new_track(db, &project_id, name.trim(), &prepared_frames)
+        commit_imported_frames_to_new_track(
+            db,
+            &project_id,
+            name.trim(),
+            &prepared_frames,
+            "GIF 帧",
+        )
     })();
 
     match &result {
@@ -954,9 +1182,277 @@ fn import_gif_to_new_track_blocking(
             track.assets.iter().map(|asset| asset.duration_frames).sum::<i64>()
         ),
         Err(_) => {
-            cleanup_gif_output(&file_paths, &output_dir);
+            cleanup_import_output(&file_paths, &output_dir, "gif");
             log::warn!(
                 "gif import failed: operation_id={}, project_id={}",
+                operation_id,
+                project_id
+            );
+        }
+    }
+    result
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn import_video_to_new_track(
+    app: AppHandle,
+    operation_id: String,
+    project_id: String,
+    name: String,
+    source_path: String,
+    start_seconds: f64,
+    end_seconds: f64,
+    sample_fps: f64,
+    project_fps: i64,
+) -> Result<TrackInfo, String> {
+    let state_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = state_app.state::<DbState>();
+        import_video_to_new_track_blocking(
+            db,
+            &state_app,
+            operation_id,
+            project_id,
+            name,
+            source_path,
+            start_seconds,
+            end_seconds,
+            sample_fps,
+            project_fps,
+        )
+    })
+    .await
+    .map_err(|error| format!("视频导入工作线程失败: {}", error))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_video_to_new_track_blocking(
+    db: State<'_, DbState>,
+    app: &AppHandle,
+    operation_id: String,
+    project_id: String,
+    name: String,
+    source_path: String,
+    start_seconds: f64,
+    end_seconds: f64,
+    sample_fps: f64,
+    project_fps: i64,
+) -> Result<TrackInfo, String> {
+    log::info!(
+        "video import started: operation_id={}, project_id={}",
+        operation_id,
+        project_id
+    );
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    {
+        return Err("视频导入 operationId 无效".to_string());
+    }
+    if name.trim().is_empty() || name.chars().count() > 128 {
+        return Err("轨道名称必须为 1..=128 个字符".to_string());
+    }
+    {
+        let conn = db
+            .lock()
+            .map_err(|error| format!("数据库锁失败: {}", error))?;
+        let project_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                params![&project_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("检查视频导入项目失败: {}", error))?;
+        if !project_exists {
+            return Err("视频导入目标项目不存在".to_string());
+        }
+    }
+
+    let _ = app.emit(
+        "video-import-progress",
+        VideoImportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "probing".to_string(),
+            completed: 0,
+            total: None,
+        },
+    );
+    let video_info = inspect_video_path(&source_path)?;
+    if end_seconds > video_info.duration_seconds + 0.001 {
+        return Err(format!(
+            "抽帧结束时间不能超过视频时长 {:.3} 秒",
+            video_info.duration_seconds
+        ));
+    }
+    let timing = plan_video_frame_timing(start_seconds, end_seconds, sample_fps, project_fps)?;
+    let ffmpeg = resolve_ffmpeg_tool("ffmpeg")?;
+    let output_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("获取应用目录失败: {}", error))?
+        .join("processed")
+        .join("videos");
+    std::fs::create_dir_all(&output_root)
+        .map_err(|error| format!("创建视频输出根目录失败: {}", error))?;
+    let output_dir = output_root.join(&operation_id);
+    std::fs::create_dir(&output_dir).map_err(|error| format!("创建视频输出目录失败: {}", error))?;
+    let file_paths: Vec<String> = (0..timing.len())
+        .map(|index| {
+            output_dir
+                .join(format!("frame_{:05}.png", index))
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    let output_pattern = output_dir.join("frame_%05d.png");
+    let duration_seconds = end_seconds - start_seconds;
+
+    let _ = app.emit(
+        "video-import-progress",
+        VideoImportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "extracting".to_string(),
+            completed: 0,
+            total: Some(timing.len()),
+        },
+    );
+    log::info!(
+        "video extraction started: operation_id={}, project_id={}, frame_count={}",
+        operation_id,
+        project_id,
+        timing.len()
+    );
+    let extraction = Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+        .arg("-ss")
+        .arg(format!("{:.6}", start_seconds))
+        .arg("-i")
+        .arg(&source_path)
+        .arg("-t")
+        .arg(format!("{:.6}", duration_seconds))
+        .args(["-map", "0:v:0", "-an", "-vf"])
+        .arg(format!("fps={:.6}", sample_fps))
+        .arg("-frames:v")
+        .arg(timing.len().to_string())
+        .args(["-start_number", "0", "-y"])
+        .arg(&output_pattern)
+        .stdin(Stdio::null())
+        .output();
+    match extraction {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            cleanup_import_output(&file_paths, &output_dir, "video");
+            log::warn!(
+                "video extraction failed: operation_id={}, project_id={}",
+                operation_id,
+                project_id
+            );
+            let details = bounded_process_error(&output.stderr);
+            return Err(if details.is_empty() {
+                "FFmpeg 视频抽帧失败".to_string()
+            } else {
+                format!("FFmpeg 视频抽帧失败: {}", details)
+            });
+        }
+        Err(error) => {
+            cleanup_import_output(&file_paths, &output_dir, "video");
+            log::warn!(
+                "video extraction failed to start: operation_id={}, project_id={}",
+                operation_id,
+                project_id
+            );
+            return Err(format!("启动 FFmpeg 失败: {}", error));
+        }
+    }
+
+    let validation_result = (|| -> Result<Vec<PreparedImportedFrame>, String> {
+        let mut output_bytes = 0_u64;
+        let mut output_dimensions = None;
+        let mut frames = Vec::with_capacity(timing.len());
+        for (index, frame_timing) in timing.iter().enumerate() {
+            let frame_path = &file_paths[index];
+            let metadata = std::fs::metadata(frame_path)
+                .map_err(|error| format!("检查视频抽帧输出失败: {}", error))?;
+            if !metadata.is_file() {
+                return Err("视频抽帧输出不是普通文件".to_string());
+            }
+            output_bytes = output_bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| "视频抽帧输出体积计数溢出".to_string())?;
+            if output_bytes > MAX_VIDEO_OUTPUT_BYTES {
+                return Err("视频抽帧输出文件总量超过 1 GiB".to_string());
+            }
+            let (width, height) = image::image_dimensions(frame_path)
+                .map_err(|error| format!("验证视频抽帧 PNG 失败: {}", error))?;
+            let frame_pixels = u64::from(width) * u64::from(height);
+            if width == 0 || height == 0 || frame_pixels > MAX_VIDEO_CANVAS_PIXELS {
+                return Err("视频抽帧 PNG 尺寸超出安全范围".to_string());
+            }
+            match output_dimensions {
+                Some(dimensions) if dimensions != (width, height) => {
+                    return Err("视频抽帧 PNG 尺寸不一致".to_string());
+                }
+                None => output_dimensions = Some((width, height)),
+                _ => {}
+            }
+            frames.push(PreparedImportedFrame {
+                path: frame_path.clone(),
+                width: i64::from(width),
+                height: i64::from(height),
+                start_frame: frame_timing.start_frame,
+                duration_frames: frame_timing.duration_frames,
+                source_timestamp: frame_timing.source_timestamp,
+            });
+        }
+        Ok(frames)
+    })();
+    let prepared_frames = match validation_result {
+        Ok(frames) => frames,
+        Err(error) => {
+            cleanup_import_output(&file_paths, &output_dir, "video");
+            log::warn!(
+                "video import failed: operation_id={}, project_id={}, stage=validate",
+                operation_id,
+                project_id
+            );
+            return Err(error);
+        }
+    };
+
+    let _ = app.emit(
+        "video-import-progress",
+        VideoImportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "committing".to_string(),
+            completed: prepared_frames.len(),
+            total: Some(prepared_frames.len()),
+        },
+    );
+    let result = commit_imported_frames_to_new_track(
+        db,
+        &project_id,
+        name.trim(),
+        &prepared_frames,
+        "视频帧",
+    );
+    match &result {
+        Ok(track) => log::info!(
+            "video import committed: operation_id={}, project_id={}, track_id={}, frame_count={}",
+            operation_id,
+            project_id,
+            track.id,
+            track.assets.len()
+        ),
+        Err(_) => {
+            cleanup_import_output(&file_paths, &output_dir, "video");
+            log::warn!(
+                "video import failed: operation_id={}, project_id={}, stage=commit",
                 operation_id,
                 project_id
             );
@@ -1626,7 +2122,10 @@ pub fn export_gif(
 
 #[cfg(test)]
 mod tests {
-    use super::{gif_delay_to_ticks, plan_sprite_sheet_slices, SpriteSheetSliceRect};
+    use super::{
+        gif_delay_to_ticks, parse_video_probe, plan_sprite_sheet_slices, plan_video_frame_timing,
+        SpriteSheetSliceRect, VideoFileInfo, VideoFrameTiming,
+    };
 
     #[test]
     fn quantizes_gif_delay_to_project_ticks_with_a_one_tick_minimum() {
@@ -1691,5 +2190,68 @@ mod tests {
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].x, 0);
         assert_eq!(slices[0].y, 0);
+    }
+
+    #[test]
+    fn plans_video_samples_without_timeline_overlap() {
+        let timing = plan_video_frame_timing(1.0, 2.0, 10.0, 24).unwrap();
+
+        assert_eq!(timing.len(), 10);
+        assert_eq!(
+            timing[0],
+            VideoFrameTiming {
+                source_timestamp: 1_000,
+                start_frame: 0,
+                duration_frames: 2,
+            }
+        );
+        assert_eq!(timing[1].start_frame, 2);
+        assert_eq!(timing[1].duration_frames, 3);
+        assert_eq!(
+            timing
+                .iter()
+                .map(|frame| frame.duration_frames)
+                .sum::<i64>(),
+            24
+        );
+        for pair in timing.windows(2) {
+            assert_eq!(
+                pair[0].start_frame + pair[0].duration_frames,
+                pair[1].start_frame
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_or_excessive_video_sampling_plans() {
+        assert!(plan_video_frame_timing(2.0, 1.0, 10.0, 24).is_err());
+        assert!(plan_video_frame_timing(0.0, 1.0, 25.0, 24).is_err());
+        assert!(plan_video_frame_timing(0.0, 1_001.0, 10.0, 24).is_err());
+        assert!(plan_video_frame_timing(f64::NAN, 1.0, 10.0, 24).is_err());
+    }
+
+    #[test]
+    fn parses_video_probe_and_falls_back_to_container_duration() {
+        let info = parse_video_probe(
+            r#"{
+                "streams": [{ "width": 64, "height": 32, "duration": "N/A" }],
+                "format": { "duration": "3.25" }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            info,
+            VideoFileInfo {
+                width: 64,
+                height: 32,
+                duration_seconds: 3.25,
+            }
+        );
+        assert!(parse_video_probe(r#"{ "streams": [], "format": {} }"#).is_err());
+        assert!(parse_video_probe(
+            r#"{ "streams": [{ "width": 0, "height": 32, "duration": "1" }] }"#
+        )
+        .is_err());
     }
 }

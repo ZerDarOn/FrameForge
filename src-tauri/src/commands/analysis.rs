@@ -7,14 +7,20 @@ use crate::db::DbState;
 use rusqlite::{params, Connection};
 use tauri::{AppHandle, Emitter, State};
 
-fn load_track_paths(
+#[derive(Debug, PartialEq)]
+struct TrackFrameSource {
+    source_path: String,
+    start_frame: i64,
+}
+
+fn load_track_frames(
     conn: &Connection,
     project_id: &str,
     track_id: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<TrackFrameSource>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT assets.source_path
+            "SELECT assets.source_path, assets.start_frame
              FROM assets
              INNER JOIN tracks ON tracks.id = assets.track_id
              WHERE assets.track_id = ?1 AND tracks.project_id = ?2
@@ -22,13 +28,22 @@ fn load_track_paths(
         )
         .map_err(|e| format!("查询资产失败: {}", e))?;
     let rows = stmt
-        .query_map(params![track_id, project_id], |row| row.get(0))
+        .query_map(params![track_id, project_id], |row| {
+            Ok(TrackFrameSource {
+                source_path: row.get(0)?,
+                start_frame: row.get(1)?,
+            })
+        })
         .map_err(|e| format!("读取路径失败: {}", e))?;
-    let mut paths = Vec::new();
+    let mut frames = Vec::new();
     for row in rows {
-        paths.push(row.map_err(|e| format!("读取资产路径行失败: {}", e))?);
+        let frame = row.map_err(|e| format!("读取资产路径行失败: {}", e))?;
+        if frame.start_frame < 0 || frame.start_frame > i64::from(i32::MAX) {
+            return Err("资产时间线帧号超出安全范围".to_string());
+        }
+        frames.push(frame);
     }
-    Ok(paths)
+    Ok(frames)
 }
 
 #[tauri::command]
@@ -41,14 +56,14 @@ pub fn analyze_track(
 ) -> Result<AnalysisReport, String> {
     let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
 
-    let paths = load_track_paths(&conn, &project_id, &track_id)?;
+    let frames = load_track_frames(&conn, &project_id, &track_id)?;
     drop(conn);
 
-    if paths.is_empty() {
+    if frames.is_empty() {
         return Err("轨道中没有帧".to_string());
     }
 
-    let total = paths.len();
+    let total = frames.len();
 
     app.emit(
         "analysis-progress",
@@ -61,8 +76,8 @@ pub fn analyze_track(
     // ── 第 1 遍：逐帧计算亮度（仅保留 f64 序列，~8 bytes/帧）──
     let mut brightnesses: Vec<f64> = Vec::with_capacity(total);
 
-    for (i, path) in paths.iter().enumerate() {
-        let (data, w, h) = load_frame_rgba(path)?;
+    for (i, frame) in frames.iter().enumerate() {
+        let (data, w, h) = load_frame_rgba(&frame.source_path)?;
         brightnesses.push(compute_brightness(&data, w, h));
         // data 在此处自动 drop，释放 ~W*H*4 字节
 
@@ -89,12 +104,18 @@ pub fn analyze_track(
     let mut displacement = Vec::with_capacity(total.saturating_sub(1));
 
     if total > 1 {
-        let (mut prev_data, mut prev_w, mut prev_h) = load_frame_rgba(&paths[0])?;
+        let (mut prev_data, mut prev_w, mut prev_h) = load_frame_rgba(&frames[0].source_path)?;
 
         for i in 1..total {
-            let (cur_data, cur_w, cur_h) = load_frame_rgba(&paths[i])?;
+            let (cur_data, cur_w, cur_h) = load_frame_rgba(&frames[i].source_path)?;
             displacement.push(detect_displacement_pair(
-                &prev_data, prev_w, prev_h, &cur_data, cur_w, cur_h, i as i64,
+                &prev_data,
+                prev_w,
+                prev_h,
+                &cur_data,
+                cur_w,
+                cur_h,
+                frames[i].start_frame,
             ));
             // 释放前一帧，替换为当前帧用于下轮迭代
             prev_data = cur_data;
@@ -122,7 +143,10 @@ pub fn analyze_track(
     )
     .ok();
 
-    let flicker_frames = detect_flicker_from_brightnesses(&brightnesses);
+    let mut flicker_frames = detect_flicker_from_brightnesses(&brightnesses);
+    for (result, frame) in flicker_frames.iter_mut().zip(frames.iter().skip(1)) {
+        result.frame_index = frame.start_frame;
+    }
 
     app.emit(
         "analysis-progress",
@@ -249,25 +273,26 @@ pub fn cloud_consistency_check(
     drop(cfg);
 
     let conn = db.lock().map_err(|e| format!("数据库锁失败: {}", e))?;
-    let paths = load_track_paths(&conn, &project_id, &track_id)?;
+    let frames = load_track_frames(&conn, &project_id, &track_id)?;
     drop(conn);
 
-    if paths.is_empty() {
+    if frames.is_empty() {
         return Err("轨道中没有帧".to_string());
     }
 
     app.emit(
         "analysis-progress",
         serde_json::json!({
-            "projectId": project_id, "stage": "loading", "current": 0, "total": paths.len()
+            "projectId": project_id, "stage": "loading", "current": 0, "total": frames.len()
         }),
     )
     .ok();
 
     // 编码帧为 base64
     let mut frames_b64 = Vec::new();
-    for (i, path) in paths.iter().enumerate() {
-        let data = std::fs::read(path).map_err(|e| format!("读取帧 {} 失败: {}", i, e))?;
+    for (i, frame) in frames.iter().enumerate() {
+        let data =
+            std::fs::read(&frame.source_path).map_err(|e| format!("读取帧 {} 失败: {}", i, e))?;
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
         frames_b64.push(b64);
     }
@@ -297,7 +322,7 @@ pub fn cloud_consistency_check(
         project_id: project_id.clone(),
         track_id,
         analyzed_at: chrono::Utc::now().timestamp_millis(),
-        total_frames: paths.len() as i64,
+        total_frames: frames.len() as i64,
         displacement: vec![],
         flicker_frames: vec![],
         consistency_score: consistency.score,
@@ -328,7 +353,7 @@ pub fn cloud_consistency_check(
 
 #[cfg(test)]
 mod tests {
-    use super::load_track_paths;
+    use super::{load_track_frames, TrackFrameSource};
     use rusqlite::{params, Connection};
 
     #[test]
@@ -355,16 +380,26 @@ mod tests {
         conn.execute(
             "INSERT INTO assets (id, track_id, source_path, start_frame)
              VALUES (?1, ?2, ?3, ?4)",
-            params!["asset-b", "track-b", "B:/frame.png", 0],
+            params!["asset-b", "track-b", "B:/frame.png", 7],
         )
         .expect("insert asset");
 
-        assert!(load_track_paths(&conn, "project-a", "track-b")
+        assert!(load_track_frames(&conn, "project-a", "track-b")
             .expect("mismatched project query")
             .is_empty());
         assert_eq!(
-            load_track_paths(&conn, "project-b", "track-b").expect("owned track query"),
-            vec!["B:/frame.png".to_string()],
+            load_track_frames(&conn, "project-b", "track-b").expect("owned track query"),
+            vec![TrackFrameSource {
+                source_path: "B:/frame.png".to_string(),
+                start_frame: 7,
+            }],
         );
+
+        conn.execute(
+            "UPDATE assets SET start_frame = -1 WHERE id = ?1",
+            params!["asset-b"],
+        )
+        .expect("corrupt frame index");
+        assert!(load_track_frames(&conn, "project-b", "track-b").is_err());
     }
 }

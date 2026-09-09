@@ -63,6 +63,7 @@ pub fn run() {
             commands::asset::export_gif,
             commands::rendered_export::write_rendered_png_sequence,
             commands::rendered_export::write_rendered_gif,
+            commands::rendered_export::write_rendered_mp4,
             commands::ai_config::get_ai_config,
             commands::ai_config::set_ai_api_key,
             commands::ai_config::toggle_ai_provider,

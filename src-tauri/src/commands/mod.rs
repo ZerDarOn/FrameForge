@@ -5,3 +5,4 @@ pub mod asset;
 pub mod generation;
 pub mod project;
 pub mod rendered_export;
+mod ffmpeg;

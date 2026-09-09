@@ -34,15 +34,12 @@ export function ExportDialog({ onClose }: Props) {
     }
 
     try {
-      const selected =
-        format === "mp4"
-          ? null
-          : await chooseExportDestination(
-              format,
-              project.name,
-              openDialog,
-              saveDialog,
-            );
+      const selected = await chooseExportDestination(
+        format,
+        project.name,
+        openDialog,
+        saveDialog,
+      );
       if (!selected) return;
       setExporting(true);
       setResult(null);
@@ -69,6 +66,18 @@ export function ExportDialog({ onClose }: Props) {
           frames,
         });
         setResult(`成功导出 GIF（${count} 帧）到:\n${selected}`);
+      } else if (format === "mp4") {
+        const frames = await new AnimationCanvasRenderer().renderPngFrames(
+          document,
+          animation.id,
+        );
+        const count = await invoke<number>("write_rendered_mp4", {
+          operationId: crypto.randomUUID(),
+          outputPath: selected,
+          fps: timing?.fps ?? 1,
+          frames,
+        });
+        setResult(`成功导出 MP4（${count} 帧）到:\n${selected}`);
       }
     } catch (err) {
       setResult(`导出失败: ${err instanceof Error ? err.message : String(err)}`);
@@ -80,7 +89,7 @@ export function ExportDialog({ onClose }: Props) {
   const formats: { key: ExportFormat; label: string; desc: string; available: boolean }[] = [
     { key: "png_sequence", label: "PNG 序列帧", desc: "逐帧导出为 PNG 图片", available: true },
     { key: "gif", label: "GIF 动画", desc: "导出为 GIF 动画文件", available: true },
-    { key: "mp4", label: "MP4 视频", desc: "导出为 MP4 视频文件", available: false },
+    { key: "mp4", label: "MP4 视频", desc: "H.264 编码，透明区域显示为黑色", available: true },
   ];
 
   return (

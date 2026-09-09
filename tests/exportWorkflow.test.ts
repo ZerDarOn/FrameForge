@@ -28,6 +28,30 @@ test("GIF destination uses the save dialog and cancellation remains side-effect 
   assert.equal(saveOptions?.defaultPath, "walk-cycle.gif");
 });
 
+test("MP4 destination uses an MP4-filtered save dialog", async () => {
+  let saveOptions: {
+    title?: string;
+    defaultPath?: string;
+    filters?: { name: string; extensions: string[] }[];
+  } | null = null;
+  const selected = await chooseExportDestination(
+    "mp4",
+    "walk-cycle",
+    async () => "wrong",
+    async (options) => {
+      saveOptions = options;
+      return "D:/exports/walk-cycle.mp4";
+    },
+  );
+
+  assert.equal(selected, "D:/exports/walk-cycle.mp4");
+  assert.deepEqual(saveOptions, {
+    title: "保存 MP4 文件",
+    defaultPath: "walk-cycle.mp4",
+    filters: [{ name: "MP4", extensions: ["mp4"] }],
+  });
+});
+
 test("export timing is derived from the animation document", () => {
   const project: Project = {
     id: "export-project",

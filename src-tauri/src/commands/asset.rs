@@ -1,3 +1,4 @@
+use super::ffmpeg::resolve_ffmpeg_tool;
 use crate::db::DbState;
 use image::{AnimationDecoder, ImageDecoder};
 use rusqlite::params;
@@ -6,7 +7,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufReader, Read},
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -27,7 +28,6 @@ const MAX_VIDEO_FRAMES: usize = 10_000;
 const MAX_VIDEO_CANVAS_PIXELS: u64 = 16_777_216;
 const MAX_VIDEO_INPUT_BYTES: u64 = 4_294_967_296;
 const MAX_VIDEO_OUTPUT_BYTES: u64 = 1_073_741_824;
-const FFMPEG_DIRECTORY_ENV: &str = "FRAMEFORGE_FFMPEG_DIR";
 const VIDEO_IMPORT_CANCELLED: &str = "VIDEO_IMPORT_CANCELLED";
 
 struct VideoImportRecord {
@@ -356,37 +356,6 @@ fn parse_video_probe(output: &str) -> Result<VideoFileInfo, String> {
         height,
         duration_seconds,
     })
-}
-
-fn resolve_ffmpeg_tool(tool_name: &str) -> Result<PathBuf, String> {
-    let executable_name = if cfg!(windows) {
-        format!("{}.exe", tool_name)
-    } else {
-        tool_name.to_string()
-    };
-    if let Ok(directory) = std::env::var(FFMPEG_DIRECTORY_ENV) {
-        let candidate = PathBuf::from(directory).join(&executable_name);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    let path_candidate = PathBuf::from(&executable_name);
-    let available_on_path = Command::new(&path_candidate)
-        .arg("-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if available_on_path {
-        return Ok(path_candidate);
-    }
-
-    Err(format!(
-        "未找到 {}。请安装 FFmpeg，并将 {} 设置为包含 ffmpeg 与 ffprobe 的目录",
-        tool_name, FFMPEG_DIRECTORY_ENV
-    ))
 }
 
 fn bounded_process_error(stderr: &[u8]) -> String {

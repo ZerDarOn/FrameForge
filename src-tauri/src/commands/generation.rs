@@ -5,8 +5,10 @@ use base64::Engine;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::watch;
 
 const MAX_PROMPT_CHARS: usize = 2_000;
 const MAX_GENERATION_DIMENSION: u32 = 1_024;
@@ -16,7 +18,7 @@ const GENERATION_CANCELLED: &str = "GENERATION_CANCELLED";
 #[derive(Debug)]
 struct GenerationJobRecord {
     project_id: String,
-    cancelled: bool,
+    cancellation: watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -25,7 +27,7 @@ pub struct GenerationJobRegistry {
 }
 
 impl GenerationJobRegistry {
-    fn register(&self, job_id: &str, project_id: &str) -> Result<(), String> {
+    fn register(&self, job_id: &str, project_id: &str) -> Result<watch::Receiver<bool>, String> {
         let mut jobs = self
             .jobs
             .lock()
@@ -33,14 +35,15 @@ impl GenerationJobRegistry {
         if jobs.contains_key(job_id) {
             return Err("生成任务 ID 已存在".to_string());
         }
+        let (cancellation, receiver) = watch::channel(false);
         jobs.insert(
             job_id.to_string(),
             GenerationJobRecord {
                 project_id: project_id.to_string(),
-                cancelled: false,
+                cancellation,
             },
         );
-        Ok(())
+        Ok(receiver)
     }
 
     fn request_cancel(&self, job_id: &str, project_id: &str) -> Result<bool, String> {
@@ -54,7 +57,7 @@ impl GenerationJobRegistry {
         if job.project_id != project_id {
             return Ok(false);
         }
-        job.cancelled = true;
+        job.cancellation.send_replace(true);
         Ok(true)
     }
 
@@ -64,7 +67,7 @@ impl GenerationJobRegistry {
             .lock()
             .map_err(|_| "生成任务状态锁失败".to_string())?;
         match jobs.get(job_id) {
-            Some(job) if job.project_id == project_id && !job.cancelled => Ok(()),
+            Some(job) if job.project_id == project_id && !*job.cancellation.borrow() => Ok(()),
             _ => Err(GENERATION_CANCELLED.to_string()),
         }
     }
@@ -75,8 +78,24 @@ impl GenerationJobRegistry {
         };
         matches!(
             jobs.remove(job_id),
-            Some(job) if job.project_id == project_id && !job.cancelled
+            Some(job) if job.project_id == project_id && !*job.cancellation.borrow()
         )
+    }
+}
+
+async fn await_generation_or_cancel<T, F>(
+    cancellation: &mut watch::Receiver<bool>,
+    operation: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.wait_for(|cancelled| *cancelled) => {
+            Err(GENERATION_CANCELLED.to_string())
+        }
+        result = operation => result,
     }
 }
 
@@ -252,7 +271,7 @@ pub async fn generate_pixel_art(
     params: TextToPixelParams,
 ) -> Result<Vec<GeneratedAsset>, String> {
     validate_generation_request(&db, &project_id, &params)?;
-    jobs.register(&job_id, &project_id)?;
+    let mut cancellation = jobs.register(&job_id, &project_id)?;
     log::info!(
         "generation job started: job_id={}, project_id={}, variants={}",
         job_id,
@@ -301,12 +320,56 @@ pub async fn generate_pixel_art(
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() + i as u64
         });
 
-        // 根据后端类型调用不同 API
-        let img_bytes = if provider_id == "stability" {
-            generate_stability(&provider_config, &api_key, &enhanced_prompt, &params, seed).await?
+        log::info!(
+            "generation provider request started: job_id={}, project_id={}, provider={}, variant={}",
+            job_id,
+            project_id,
+            provider_id,
+            i + 1
+        );
+        let provider_result = if provider_id == "stability" {
+            await_generation_or_cancel(
+                &mut cancellation,
+                generate_stability(&provider_config, &api_key, &enhanced_prompt, &params, seed),
+            )
+            .await
         } else {
-            generate_openai(&provider_config, &api_key, &enhanced_prompt, &params).await?
+            await_generation_or_cancel(
+                &mut cancellation,
+                generate_openai(&provider_config, &api_key, &enhanced_prompt, &params),
+            )
+            .await
         };
+        if provider_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error == GENERATION_CANCELLED)
+        {
+            log::info!(
+                "generation provider request aborted: job_id={}, project_id={}, provider={}, variant={}",
+                job_id,
+                project_id,
+                provider_id,
+                i + 1
+            );
+        } else if provider_result.is_ok() {
+            log::info!(
+                "generation provider request completed: job_id={}, project_id={}, provider={}, variant={}",
+                job_id,
+                project_id,
+                provider_id,
+                i + 1
+            );
+        } else {
+            log::warn!(
+                "generation provider request failed: job_id={}, project_id={}, provider={}, variant={}",
+                job_id,
+                project_id,
+                provider_id,
+                i + 1
+            );
+        }
+        let img_bytes = provider_result?;
         jobs.ensure_active(&job_id, &project_id)?;
 
         // 降采样到目标尺寸（DALL-E 最小 1024x1024）
@@ -785,9 +848,24 @@ async fn generate_stability(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_generation_request, GenerationJobRegistry, TextToPixelParams};
+    use super::{
+        await_generation_or_cancel, validate_generation_request, GenerationJobRegistry,
+        TextToPixelParams,
+    };
     use rusqlite::Connection;
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use std::time::Duration;
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     fn params() -> TextToPixelParams {
         TextToPixelParams {
@@ -820,6 +898,49 @@ mod tests {
             "GENERATION_CANCELLED"
         );
         assert!(!jobs.finish("job-a", "project-a"));
+    }
+
+    #[test]
+    fn cancellation_drops_an_in_flight_generation_request() {
+        let jobs = Arc::new(GenerationJobRegistry::default());
+        let mut cancellation = jobs.register("job-a", "project-a").expect("register");
+        let request_dropped = Arc::new(AtomicBool::new(false));
+        let cancel_jobs = Arc::clone(&jobs);
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(cancel_jobs
+                .request_cancel("job-a", "project-a")
+                .expect("cancel request"));
+        });
+
+        let request_drop_marker = Arc::clone(&request_dropped);
+        let result = tauri::async_runtime::block_on(await_generation_or_cancel(
+            &mut cancellation,
+            async move {
+                let _drop_marker = DropMarker(request_drop_marker);
+                std::future::pending::<Result<Vec<u8>, String>>().await
+            },
+        ));
+
+        cancel_thread.join().expect("cancel thread");
+        assert_eq!(result.unwrap_err(), "GENERATION_CANCELLED");
+        assert!(request_dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancellation_wins_when_the_request_result_is_already_ready() {
+        let jobs = GenerationJobRegistry::default();
+        let mut cancellation = jobs.register("job-a", "project-a").expect("register");
+        assert!(jobs
+            .request_cancel("job-a", "project-a")
+            .expect("cancel request"));
+
+        let result =
+            tauri::async_runtime::block_on(await_generation_or_cancel(&mut cancellation, async {
+                Ok::<_, String>(vec![1, 2, 3])
+            }));
+
+        assert_eq!(result.unwrap_err(), "GENERATION_CANCELLED");
     }
 
     #[test]

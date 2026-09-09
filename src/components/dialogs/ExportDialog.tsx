@@ -14,13 +14,13 @@ import {
   getAnimationExportTiming,
 } from "../../core/exportWorkflow";
 
-type ExportFormat = "png_sequence" | "gif" | "mp4";
+type ExportFormat = "png_sequence" | "gif" | "mp4" | "webp";
 
 interface Props {
   onClose: () => void;
 }
 
-interface Mp4ExportProgress {
+interface AnimationMediaExportProgress {
   operationId: string;
   projectId: string;
   stage: "preparing" | "encoding" | "committing";
@@ -40,25 +40,34 @@ export function ExportDialog({ onClose }: Props) {
   const activeFormatRef = useRef<ExportFormat | null>(null);
   const phaseRef = useRef<"idle" | "rendering" | "writing">("idle");
   const abortControllerRef = useRef<AbortController | null>(null);
-  const mp4BackendReadyRef = useRef(false);
+  const mediaBackendReadyRef = useRef(false);
   const cancelRequestedRef = useRef(false);
   const cancelSentRef = useRef(false);
   const animation = document?.animations[0];
   const timing = document && animation ? getAnimationExportTiming(document) : null;
 
-  const sendMp4Cancellation = async (operationId: string, projectId: string) => {
+  const sendAnimationMediaCancellation = async (
+    operationId: string,
+    projectId: string,
+    activeFormat: "mp4" | "webp",
+  ) => {
     if (cancelSentRef.current) return;
     cancelSentRef.current = true;
     try {
-      const accepted = await invoke<boolean>("cancel_rendered_mp4_export", {
-        operationId,
-        projectId,
-      });
+      const accepted = await invoke<boolean>(
+        activeFormat === "mp4"
+          ? "cancel_rendered_mp4_export"
+          : "cancel_rendered_webp_export",
+        {
+          operationId,
+          projectId,
+        },
+      );
       if (!accepted && activeOperationRef.current === operationId) {
         cancelRequestedRef.current = false;
         cancelSentRef.current = false;
         setCancelling(false);
-        setResult("MP4 已进入文件提交阶段，无法取消。");
+        setResult(`${activeFormat === "mp4" ? "MP4" : "WebP"} 已进入文件提交阶段，无法取消。`);
       }
     } catch (cancelError) {
       if (activeOperationRef.current !== operationId) return;
@@ -89,8 +98,11 @@ export function ExportDialog({ onClose }: Props) {
     setCancelling(true);
     setResult(null);
     abortControllerRef.current?.abort();
-    if (activeFormat === "mp4" && mp4BackendReadyRef.current) {
-      void sendMp4Cancellation(operationId, projectId);
+    if (
+      (activeFormat === "mp4" || activeFormat === "webp") &&
+      mediaBackendReadyRef.current
+    ) {
+      void sendAnimationMediaCancellation(operationId, projectId, activeFormat);
     }
   };
 
@@ -103,10 +115,14 @@ export function ExportDialog({ onClose }: Props) {
     if (
       operationId &&
       projectId &&
-      activeFormatRef.current === "mp4" &&
-      mp4BackendReadyRef.current
+      (activeFormatRef.current === "mp4" || activeFormatRef.current === "webp") &&
+      mediaBackendReadyRef.current
     ) {
-      void sendMp4Cancellation(operationId, projectId);
+      void sendAnimationMediaCancellation(
+        operationId,
+        projectId,
+        activeFormatRef.current,
+      );
     }
     onClose();
   }, [initialProjectId, onClose, project?.id]);
@@ -133,21 +149,25 @@ export function ExportDialog({ onClose }: Props) {
       activeFormatRef.current = format;
       phaseRef.current = "rendering";
       abortControllerRef.current = controller;
-      mp4BackendReadyRef.current = false;
+      mediaBackendReadyRef.current = false;
       cancelRequestedRef.current = false;
       cancelSentRef.current = false;
       setExporting(true);
       setCancelling(false);
       setResult(null);
       let unlisten: (() => void) | undefined;
-      if (format === "mp4") {
-        unlisten = await listen<Mp4ExportProgress>("mp4-export-progress", ({ payload }) => {
-          if (payload.operationId !== operationId || payload.projectId !== project.id) return;
-          mp4BackendReadyRef.current = true;
-          if (cancelRequestedRef.current) {
-            void sendMp4Cancellation(operationId, project.id);
-          }
-        });
+      if (format === "mp4" || format === "webp") {
+        const activeMediaFormat = format;
+        unlisten = await listen<AnimationMediaExportProgress>(
+          `${format}-export-progress`,
+          ({ payload }) => {
+            if (payload.operationId !== operationId || payload.projectId !== project.id) return;
+            mediaBackendReadyRef.current = true;
+            if (cancelRequestedRef.current) {
+              void sendAnimationMediaCancellation(operationId, project.id, activeMediaFormat);
+            }
+          },
+        );
       }
       try {
         if (format === "png_sequence") {
@@ -192,13 +212,32 @@ export function ExportDialog({ onClose }: Props) {
             frames,
           });
           setResult(`成功导出 MP4（${count} 帧）到:\n${selected}`);
+        } else if (format === "webp") {
+          const frames = await new AnimationCanvasRenderer().renderPngFrames(
+            document,
+            animation.id,
+            controller.signal,
+          );
+          phaseRef.current = "writing";
+          const count = await invoke<number>("write_rendered_webp", {
+            operationId,
+            projectId: project.id,
+            outputPath: selected,
+            fps: timing?.fps ?? 1,
+            frames,
+          });
+          setResult(`成功导出 WebP（${count} 帧）到:\n${selected}`);
         }
       } finally {
         unlisten?.();
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (message.includes(EXPORT_CANCELLED) || message.includes("MP4_EXPORT_CANCELLED")) {
+      if (
+        message.includes(EXPORT_CANCELLED) ||
+        message.includes("MP4_EXPORT_CANCELLED") ||
+        message.includes("WEBP_EXPORT_CANCELLED")
+      ) {
         onClose();
       } else {
         setResult(`导出失败: ${message}`);
@@ -209,7 +248,7 @@ export function ExportDialog({ onClose }: Props) {
       activeFormatRef.current = null;
       phaseRef.current = "idle";
       abortControllerRef.current = null;
-      mp4BackendReadyRef.current = false;
+      mediaBackendReadyRef.current = false;
       cancelRequestedRef.current = false;
       cancelSentRef.current = false;
       setExporting(false);
@@ -221,6 +260,7 @@ export function ExportDialog({ onClose }: Props) {
     { key: "png_sequence", label: "PNG 序列帧", desc: "逐帧导出为 PNG 图片", available: true },
     { key: "gif", label: "GIF 动画", desc: "导出为 GIF 动画文件", available: true },
     { key: "mp4", label: "MP4 视频", desc: "H.264 编码，透明区域显示为黑色", available: true },
+    { key: "webp", label: "WebP 动画", desc: "无损编码并保留透明通道", available: true },
   ];
 
   return (

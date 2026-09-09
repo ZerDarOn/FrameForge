@@ -1,7 +1,7 @@
 import { getAnimationDurationTicks } from "./animationDocument.ts";
 import type { AnimationDocument } from "../types/animationDocument";
 
-export type AvailableExportFormat = "png_sequence" | "gif" | "mp4";
+export type AvailableExportFormat = "png_sequence" | "gif" | "mp4" | "webp";
 
 interface FileDialogOptions {
   directory?: boolean;
@@ -27,11 +27,17 @@ export async function chooseExportDestination(
             defaultPath: `${projectName}.gif`,
             filters: [{ name: "GIF", extensions: ["gif"] }],
           })
-        : await saveFile({
-            title: "保存 MP4 文件",
-            defaultPath: `${projectName}.mp4`,
-            filters: [{ name: "MP4", extensions: ["mp4"] }],
-          });
+        : format === "mp4"
+          ? await saveFile({
+              title: "保存 MP4 文件",
+              defaultPath: `${projectName}.mp4`,
+              filters: [{ name: "MP4", extensions: ["mp4"] }],
+            })
+          : await saveFile({
+              title: "保存 WebP 文件",
+              defaultPath: `${projectName}.webp`,
+              filters: [{ name: "WebP", extensions: ["webp"] }],
+            });
   return typeof selected === "string" ? selected : null;
 }
 

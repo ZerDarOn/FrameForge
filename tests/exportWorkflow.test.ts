@@ -52,6 +52,30 @@ test("MP4 destination uses an MP4-filtered save dialog", async () => {
   });
 });
 
+test("WebP destination uses a WebP-filtered save dialog", async () => {
+  let saveOptions: {
+    title?: string;
+    defaultPath?: string;
+    filters?: { name: string; extensions: string[] }[];
+  } | null = null;
+  const selected = await chooseExportDestination(
+    "webp",
+    "walk-cycle",
+    async () => "wrong",
+    async (options) => {
+      saveOptions = options;
+      return "D:/exports/walk-cycle.webp";
+    },
+  );
+
+  assert.equal(selected, "D:/exports/walk-cycle.webp");
+  assert.deepEqual(saveOptions, {
+    title: "保存 WebP 文件",
+    defaultPath: "walk-cycle.webp",
+    filters: [{ name: "WebP", extensions: ["webp"] }],
+  });
+});
+
 test("export timing is derived from the animation document", () => {
   const project: Project = {
     id: "export-project",

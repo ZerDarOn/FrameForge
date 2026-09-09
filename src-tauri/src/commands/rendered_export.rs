@@ -20,30 +20,47 @@ const MAX_DECODED_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EXPORT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_EXPORT_CANVAS_PIXELS: u64 = 16_777_216;
 const MP4_EXPORT_CANCELLED: &str = "MP4_EXPORT_CANCELLED";
+const WEBP_EXPORT_CANCELLED: &str = "WEBP_EXPORT_CANCELLED";
+const WEBP_FFMPEG_OUTPUT_ARGS: [&str; 14] = [
+    "-an",
+    "-c:v",
+    "libwebp_anim",
+    "-lossless",
+    "1",
+    "-compression_level",
+    "6",
+    "-loop",
+    "0",
+    "-pix_fmt",
+    "rgba",
+    "-f",
+    "webp",
+    "-y",
+];
 
-struct Mp4ExportRecord {
+struct RenderedAnimationExportRecord {
     project_id: String,
     cancellation: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
-pub struct Mp4ExportRegistry {
-    operations: Mutex<HashMap<String, Mp4ExportRecord>>,
+pub struct RenderedAnimationExportRegistry {
+    operations: Mutex<HashMap<String, RenderedAnimationExportRecord>>,
 }
 
-impl Mp4ExportRegistry {
+impl RenderedAnimationExportRegistry {
     fn register(&self, operation_id: &str, project_id: &str) -> Result<Arc<AtomicBool>, String> {
         let mut operations = self
             .operations
             .lock()
-            .map_err(|error| format!("MP4 导出注册表锁定失败: {}", error))?;
+            .map_err(|error| format!("动画媒体导出注册表锁定失败: {}", error))?;
         if operations.contains_key(operation_id) {
-            return Err("MP4 导出 operationId 已存在".to_string());
+            return Err("动画媒体导出 operationId 已存在".to_string());
         }
         let cancellation = Arc::new(AtomicBool::new(false));
         operations.insert(
             operation_id.to_string(),
-            Mp4ExportRecord {
+            RenderedAnimationExportRecord {
                 project_id: project_id.to_string(),
                 cancellation: cancellation.clone(),
             },
@@ -55,7 +72,7 @@ impl Mp4ExportRegistry {
         let operations = self
             .operations
             .lock()
-            .map_err(|error| format!("MP4 导出注册表锁定失败: {}", error))?;
+            .map_err(|error| format!("动画媒体导出注册表锁定失败: {}", error))?;
         let Some(record) = operations.get(operation_id) else {
             return Ok(false);
         };
@@ -68,7 +85,7 @@ impl Mp4ExportRegistry {
 
     fn finish(&self, operation_id: &str, project_id: &str) -> bool {
         let Ok(mut operations) = self.operations.lock() else {
-            log::error!("MP4 export registry lock poisoned while finishing");
+            log::error!("rendered animation export registry lock poisoned while finishing");
             return false;
         };
         let matches_project = operations
@@ -83,17 +100,17 @@ impl Mp4ExportRegistry {
     }
 }
 
-struct Mp4ExportRegistration<'a> {
-    registry: &'a Mp4ExportRegistry,
+struct RenderedAnimationExportRegistration<'a> {
+    registry: &'a RenderedAnimationExportRegistry,
     operation_id: String,
     project_id: String,
     cancellation: Arc<AtomicBool>,
     active: bool,
 }
 
-impl<'a> Mp4ExportRegistration<'a> {
+impl<'a> RenderedAnimationExportRegistration<'a> {
     fn new(
-        registry: &'a Mp4ExportRegistry,
+        registry: &'a RenderedAnimationExportRegistry,
         operation_id: &str,
         project_id: &str,
     ) -> Result<Self, String> {
@@ -117,7 +134,7 @@ impl<'a> Mp4ExportRegistration<'a> {
     }
 }
 
-impl Drop for Mp4ExportRegistration<'_> {
+impl Drop for RenderedAnimationExportRegistration<'_> {
     fn drop(&mut self) {
         if self.active {
             let _ = self.registry.finish(&self.operation_id, &self.project_id);
@@ -127,7 +144,7 @@ impl Drop for Mp4ExportRegistration<'_> {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Mp4ExportProgress {
+struct RenderedAnimationExportProgress {
     operation_id: String,
     project_id: String,
     stage: String,
@@ -168,21 +185,21 @@ fn validate_operation_id(operation_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_project_id(project_id: &str) -> Result<(), String> {
+fn validate_animation_export_project_id(project_id: &str) -> Result<(), String> {
     if project_id.is_empty()
         || project_id.len() > 128
         || !project_id.chars().all(|character| {
             character.is_ascii_alphanumeric() || character == '-' || character == '_'
         })
     {
-        return Err("MP4 导出 projectId 无效".to_string());
+        return Err("动画媒体导出 projectId 无效".to_string());
     }
     Ok(())
 }
 
-fn validate_mp4_fps(fps: u32) -> Result<(), String> {
+fn validate_animation_export_fps(fps: u32) -> Result<(), String> {
     if !(1..=240).contains(&fps) {
-        return Err("MP4 帧率必须为 1..=240".to_string());
+        return Err("动画媒体导出帧率必须为 1..=240".to_string());
     }
     Ok(())
 }
@@ -225,23 +242,27 @@ fn bounded_process_error(stderr: &[u8]) -> String {
         .collect()
 }
 
-struct Mp4ExportStaging {
+struct RenderedAnimationExportStaging {
     directory: PathBuf,
 }
 
-impl Drop for Mp4ExportStaging {
+impl Drop for RenderedAnimationExportStaging {
     fn drop(&mut self) {
         if let Err(error) = std::fs::remove_dir_all(&self.directory) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("MP4 export staging cleanup failed");
+                log::warn!("rendered animation export staging cleanup failed");
             }
         }
     }
 }
 
-fn create_mp4_staging(directory: PathBuf) -> Result<Mp4ExportStaging, String> {
-    std::fs::create_dir(&directory).map_err(|error| format!("创建 MP4 暂存目录失败: {}", error))?;
-    Ok(Mp4ExportStaging { directory })
+fn create_animation_export_staging(
+    directory: PathBuf,
+    format_name: &str,
+) -> Result<RenderedAnimationExportStaging, String> {
+    std::fs::create_dir(&directory)
+        .map_err(|error| format!("创建 {} 暂存目录失败: {}", format_name, error))?;
+    Ok(RenderedAnimationExportStaging { directory })
 }
 
 #[tauri::command]
@@ -368,7 +389,7 @@ pub async fn write_rendered_mp4(
 ) -> Result<usize, String> {
     let state_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let operations = state_app.state::<Mp4ExportRegistry>();
+        let operations = state_app.state::<RenderedAnimationExportRegistry>();
         write_rendered_mp4_blocking(
             operations,
             &state_app,
@@ -384,7 +405,7 @@ pub async fn write_rendered_mp4(
 }
 
 fn write_rendered_mp4_blocking(
-    operations: State<'_, Mp4ExportRegistry>,
+    operations: State<'_, RenderedAnimationExportRegistry>,
     app: &AppHandle,
     operation_id: String,
     project_id: String,
@@ -394,8 +415,8 @@ fn write_rendered_mp4_blocking(
 ) -> Result<usize, String> {
     validate_frame_count(&frames)?;
     validate_operation_id(&operation_id)?;
-    validate_project_id(&project_id)?;
-    validate_mp4_fps(fps)?;
+    validate_animation_export_project_id(&project_id)?;
+    validate_animation_export_fps(fps)?;
 
     let output = Path::new(&output_path);
     let output_parent = output
@@ -406,10 +427,11 @@ fn write_rendered_mp4_blocking(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("MP4 输出路径无效")?;
-    let mut registration = Mp4ExportRegistration::new(&operations, &operation_id, &project_id)?;
+    let mut registration =
+        RenderedAnimationExportRegistration::new(&operations, &operation_id, &project_id)?;
     let _ = app.emit(
         "mp4-export-progress",
-        Mp4ExportProgress {
+        RenderedAnimationExportProgress {
             operation_id: operation_id.clone(),
             project_id: project_id.clone(),
             stage: "preparing".to_string(),
@@ -417,7 +439,7 @@ fn write_rendered_mp4_blocking(
     );
 
     let staging_directory = output_parent.join(format!(".frameforge-{}-mp4", operation_id));
-    let staging = create_mp4_staging(staging_directory)?;
+    let staging = create_animation_export_staging(staging_directory, "MP4")?;
 
     log::info!(
         "rendered MP4 export started: operation_id={}, frame_count={}, fps={}",
@@ -460,7 +482,7 @@ fn write_rendered_mp4_blocking(
     let ffmpeg = resolve_ffmpeg_tool("ffmpeg")?;
     let _ = app.emit(
         "mp4-export-progress",
-        Mp4ExportProgress {
+        RenderedAnimationExportProgress {
             operation_id: operation_id.clone(),
             project_id: project_id.clone(),
             stage: "encoding".to_string(),
@@ -553,7 +575,7 @@ fn write_rendered_mp4_blocking(
     }
     let _ = app.emit(
         "mp4-export-progress",
-        Mp4ExportProgress {
+        RenderedAnimationExportProgress {
             operation_id: operation_id.clone(),
             project_id: project_id.clone(),
             stage: "committing".to_string(),
@@ -608,12 +630,12 @@ fn write_rendered_mp4_blocking(
 
 #[tauri::command]
 pub fn cancel_rendered_mp4_export(
-    operations: State<'_, Mp4ExportRegistry>,
+    operations: State<'_, RenderedAnimationExportRegistry>,
     operation_id: String,
     project_id: String,
 ) -> Result<bool, String> {
     validate_operation_id(&operation_id)?;
-    validate_project_id(&project_id)?;
+    validate_animation_export_project_id(&project_id)?;
     let accepted = operations.request_cancel(&operation_id, &project_id)?;
     log::info!(
         "rendered MP4 export cancellation requested: operation_id={}, project_id={}, accepted={}",
@@ -624,16 +646,298 @@ pub fn cancel_rendered_mp4_export(
     Ok(accepted)
 }
 
+#[tauri::command]
+pub async fn write_rendered_webp(
+    app: AppHandle,
+    operation_id: String,
+    project_id: String,
+    output_path: String,
+    fps: u32,
+    frames: Vec<String>,
+) -> Result<usize, String> {
+    let state_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let operations = state_app.state::<RenderedAnimationExportRegistry>();
+        write_rendered_webp_blocking(
+            operations,
+            &state_app,
+            operation_id,
+            project_id,
+            output_path,
+            fps,
+            frames,
+        )
+    })
+    .await
+    .map_err(|error| format!("WebP 导出工作线程失败: {}", error))?
+}
+
+fn write_rendered_webp_blocking(
+    operations: State<'_, RenderedAnimationExportRegistry>,
+    app: &AppHandle,
+    operation_id: String,
+    project_id: String,
+    output_path: String,
+    fps: u32,
+    frames: Vec<String>,
+) -> Result<usize, String> {
+    validate_frame_count(&frames)?;
+    validate_operation_id(&operation_id)?;
+    validate_animation_export_project_id(&project_id)?;
+    validate_animation_export_fps(fps)?;
+
+    let output = Path::new(&output_path);
+    let output_parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty() && parent.is_dir())
+        .ok_or("WebP 输出目录不存在")?;
+    output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("WebP 输出路径无效")?;
+    let mut registration =
+        RenderedAnimationExportRegistration::new(&operations, &operation_id, &project_id)?;
+    let _ = app.emit(
+        "webp-export-progress",
+        RenderedAnimationExportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "preparing".to_string(),
+        },
+    );
+
+    let staging_directory = output_parent.join(format!(".frameforge-{}-webp", operation_id));
+    let staging = create_animation_export_staging(staging_directory, "WebP")?;
+    log::info!(
+        "rendered WebP export started: operation_id={}, frame_count={}, fps={}",
+        operation_id,
+        frames.len(),
+        fps
+    );
+
+    let mut total_bytes = 0_u64;
+    let mut dimensions = None;
+    for (index, frame) in frames.iter().enumerate() {
+        if registration.is_cancelled() {
+            log::info!(
+                "rendered WebP export cancelled: operation_id={}, project_id={}, stage=preparing",
+                operation_id,
+                project_id
+            );
+            return Err(WEBP_EXPORT_CANCELLED.to_string());
+        }
+        let bytes = decode_png_data_url(frame)?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or("WebP 导出帧总量计数溢出")?;
+        if total_bytes > MAX_EXPORT_TOTAL_BYTES {
+            return Err("WebP 导出帧总量超过 1 GiB".to_string());
+        }
+        let frame_dimensions = inspect_export_png(&bytes, index)?;
+        match dimensions {
+            Some(expected) if expected != frame_dimensions => {
+                return Err("WebP 导出帧尺寸不一致".to_string());
+            }
+            None => dimensions = Some(frame_dimensions),
+            _ => {}
+        }
+        let frame_path = staging.directory.join(format!("frame_{:05}.png", index));
+        std::fs::write(frame_path, bytes)
+            .map_err(|error| format!("暂存 WebP 帧 {} 失败: {}", index, error))?;
+    }
+
+    let ffmpeg = resolve_ffmpeg_tool("ffmpeg")?;
+    let _ = app.emit(
+        "webp-export-progress",
+        RenderedAnimationExportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "encoding".to_string(),
+        },
+    );
+    let encoded_path = staging.directory.join("rendered.webp");
+    let input_pattern = staging.directory.join("frame_%05d.png");
+    let mut child = Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+        .arg("-framerate")
+        .arg(fps.to_string())
+        .arg("-start_number")
+        .arg("0")
+        .arg("-i")
+        .arg(input_pattern)
+        .arg("-frames:v")
+        .arg(frames.len().to_string())
+        .args(WEBP_FFMPEG_OUTPUT_ARGS)
+        .arg(&encoded_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("启动 FFmpeg WebP 编码失败: {}", error))?;
+    let stderr_reader = match child.stderr.take() {
+        Some(stderr) => read_bounded_stderr(stderr),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("无法读取 FFmpeg WebP 错误输出".to_string());
+        }
+    };
+    let status = loop {
+        if registration.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            log::info!(
+                "rendered WebP export cancelled: operation_id={}, project_id={}, stage=encoding",
+                operation_id,
+                project_id
+            );
+            return Err(WEBP_EXPORT_CANCELLED.to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(format!("等待 FFmpeg WebP 编码失败: {}", error));
+            }
+        }
+    };
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        let details = bounded_process_error(&stderr);
+        log::warn!(
+            "rendered WebP export failed: operation_id={}, frame_count={}, fps={}",
+            operation_id,
+            frames.len(),
+            fps
+        );
+        return Err(if details.is_empty() {
+            "FFmpeg WebP 编码失败".to_string()
+        } else {
+            format!("FFmpeg WebP 编码失败: {}", details)
+        });
+    }
+
+    if !registration.claim_commit() {
+        log::info!(
+            "rendered WebP export cancelled: operation_id={}, project_id={}, stage=before_commit",
+            operation_id,
+            project_id
+        );
+        return Err(WEBP_EXPORT_CANCELLED.to_string());
+    }
+    let _ = app.emit(
+        "webp-export-progress",
+        RenderedAnimationExportProgress {
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            stage: "committing".to_string(),
+        },
+    );
+
+    let backup_path = output_parent.join(format!(".frameforge-{}-previous.webp", operation_id));
+    let had_previous_output = output.exists();
+    if had_previous_output {
+        let metadata = std::fs::symlink_metadata(output)
+            .map_err(|error| format!("检查旧 WebP 失败: {}", error))?;
+        if !metadata.file_type().is_file() {
+            return Err("WebP 输出位置不是普通文件".to_string());
+        }
+        if backup_path.exists() {
+            return Err("WebP 备份路径已存在，请重试导出".to_string());
+        }
+        std::fs::rename(output, &backup_path)
+            .map_err(|error| format!("暂存旧 WebP 失败: {}", error))?;
+    }
+    if let Err(error) = std::fs::rename(&encoded_path, output) {
+        if had_previous_output {
+            if let Err(restore_error) = std::fs::rename(&backup_path, output) {
+                return Err(format!(
+                    "提交 WebP 失败: {}；恢复旧文件失败: {}。旧文件保留在 {}",
+                    error,
+                    restore_error,
+                    backup_path.display()
+                ));
+            }
+        }
+        return Err(format!("提交 WebP 文件失败: {}", error));
+    }
+    if had_previous_output {
+        if let Err(error) = std::fs::remove_file(&backup_path) {
+            log::warn!(
+                "rendered WebP previous-output cleanup failed: operation_id={}",
+                operation_id
+            );
+            return Err(format!("WebP 已导出，但旧文件备份清理失败: {}", error));
+        }
+    }
+
+    log::info!(
+        "rendered WebP export completed: operation_id={}, frame_count={}, fps={}",
+        operation_id,
+        frames.len(),
+        fps
+    );
+    Ok(frames.len())
+}
+
+#[tauri::command]
+pub fn cancel_rendered_webp_export(
+    operations: State<'_, RenderedAnimationExportRegistry>,
+    operation_id: String,
+    project_id: String,
+) -> Result<bool, String> {
+    validate_operation_id(&operation_id)?;
+    validate_animation_export_project_id(&project_id)?;
+    let accepted = operations.request_cancel(&operation_id, &project_id)?;
+    log::info!(
+        "rendered WebP export cancellation requested: operation_id={}, project_id={}, accepted={}",
+        operation_id,
+        project_id,
+        accepted
+    );
+    Ok(accepted)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{create_mp4_staging, validate_mp4_fps, Mp4ExportRegistry};
+    use super::{
+        create_animation_export_staging, validate_animation_export_fps,
+        RenderedAnimationExportRegistry, WEBP_FFMPEG_OUTPUT_ARGS,
+    };
 
     #[test]
     fn mp4_export_rejects_unsafe_frame_rates() {
-        assert!(validate_mp4_fps(0).is_err());
-        assert!(validate_mp4_fps(1).is_ok());
-        assert!(validate_mp4_fps(240).is_ok());
-        assert!(validate_mp4_fps(241).is_err());
+        assert!(validate_animation_export_fps(0).is_err());
+        assert!(validate_animation_export_fps(1).is_ok());
+        assert!(validate_animation_export_fps(240).is_ok());
+        assert!(validate_animation_export_fps(241).is_err());
+    }
+
+    #[test]
+    fn webp_export_uses_lossless_animation_with_alpha_and_looping() {
+        assert_eq!(
+            WEBP_FFMPEG_OUTPUT_ARGS,
+            [
+                "-an",
+                "-c:v",
+                "libwebp_anim",
+                "-lossless",
+                "1",
+                "-compression_level",
+                "6",
+                "-loop",
+                "0",
+                "-pix_fmt",
+                "rgba",
+                "-f",
+                "webp",
+                "-y",
+            ]
+        );
     }
 
     #[test]
@@ -646,7 +950,7 @@ mod tests {
         let sentinel = directory.join("keep.txt");
         std::fs::write(&sentinel, b"keep").expect("write sentinel");
 
-        assert!(create_mp4_staging(directory.clone()).is_err());
+        assert!(create_animation_export_staging(directory.clone(), "MP4").is_err());
         assert!(sentinel.is_file());
 
         std::fs::remove_file(sentinel).expect("remove sentinel");
@@ -655,7 +959,7 @@ mod tests {
 
     #[test]
     fn mp4_cancellation_is_scoped_and_closes_before_commit() {
-        let operations = Mp4ExportRegistry::default();
+        let operations = RenderedAnimationExportRegistry::default();
         let cancellation = operations
             .register("operation-a", "project-a")
             .expect("register");

@@ -27,7 +27,7 @@ pub fn run() {
             app.manage(ai::AiConfig::new(ai::config::AiConfigState::default()));
             app.manage(commands::generation::GenerationJobRegistry::default());
             app.manage(commands::asset::VideoImportRegistry::default());
-            app.manage(commands::rendered_export::Mp4ExportRegistry::default());
+            app.manage(commands::rendered_export::RenderedAnimationExportRegistry::default());
 
             Ok(())
         })
@@ -66,6 +66,8 @@ pub fn run() {
             commands::rendered_export::write_rendered_gif,
             commands::rendered_export::write_rendered_mp4,
             commands::rendered_export::cancel_rendered_mp4_export,
+            commands::rendered_export::write_rendered_webp,
+            commands::rendered_export::cancel_rendered_webp_export,
             commands::ai_config::get_ai_config,
             commands::ai_config::set_ai_api_key,
             commands::ai_config::toggle_ai_provider,
